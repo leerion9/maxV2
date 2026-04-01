@@ -5,6 +5,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict
+import sys
 
 
 class TradeLogger:
@@ -14,14 +15,22 @@ class TradeLogger:
 
         self._logger = logging.getLogger("maxv")
         self._logger.setLevel(logging.INFO)
+        self._logger.propagate = False
 
-        file_handler = logging.FileHandler(self.log_dir / "system.log", encoding="utf-8")
+        self._file_handler = logging.FileHandler(
+            self.log_dir / "system.log",
+            encoding="utf-8",
+            delay=False,
+        )
         formatter = logging.Formatter(
             "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
         )
-        file_handler.setFormatter(formatter)
+        self._file_handler.setFormatter(formatter)
+        self._stream_handler = logging.StreamHandler(stream=sys.stdout)
+        self._stream_handler.setFormatter(formatter)
         self._logger.handlers.clear()
-        self._logger.addHandler(file_handler)
+        self._logger.addHandler(self._file_handler)
+        self._logger.addHandler(self._stream_handler)
 
         self.trade_csv = self.log_dir / "trades.csv"
         self._trade_fields = [
@@ -54,6 +63,7 @@ class TradeLogger:
             "note",
         ]
         self._ensure_csv_header(self.signal_csv, self._signal_fields)
+        self.info(f"Logger ready: log_dir={self.log_dir.resolve()!s}")
 
     @staticmethod
     def _ensure_csv_header(path: Path, fieldnames: list[str]) -> None:
@@ -94,20 +104,29 @@ class TradeLogger:
 
     def info(self, message: str) -> None:
         self._logger.info(message)
-        print(message)
+        self._flush()
 
     def error(self, message: str) -> None:
         self._logger.error(message)
-        print(message)
+        self._flush()
+
+    def _flush(self) -> None:
+        for h in list(self._logger.handlers):
+            try:
+                h.flush()
+            except Exception:
+                continue
 
     def log_trade(self, row: Dict[str, object]) -> None:
         payload = {"ts": datetime.now().isoformat(timespec="seconds"), **row}
         with self.trade_csv.open("a", newline="", encoding="utf-8") as fp:
             writer = csv.DictWriter(fp, fieldnames=self._trade_fields, extrasaction="ignore")
             writer.writerow(payload)
+        self._flush()
 
     def log_signal(self, row: Dict[str, object]) -> None:
         payload = {"ts": datetime.now().isoformat(timespec="seconds"), **row}
         with self.signal_csv.open("a", newline="", encoding="utf-8") as fp:
             writer = csv.DictWriter(fp, fieldnames=self._signal_fields, extrasaction="ignore")
             writer.writerow(payload)
+        self._flush()

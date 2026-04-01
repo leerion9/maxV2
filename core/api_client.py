@@ -3,11 +3,31 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Dict, List, Optional, Tuple
 
 import requests
+from zoneinfo import ZoneInfo
 
 from config.settings import Settings
+
+
+def _kis_json_payload_rate_limited(data: object) -> bool:
+    if not isinstance(data, dict):
+        return False
+    msg = str(data.get("msg1", "") or data.get("message", "") or "")
+    return "EGW00201" in msg or "초당 거래건수" in msg
+
+
+def _response_is_rate_limited(resp: requests.Response) -> bool:
+    if resp.status_code == 429:
+        return True
+    try:
+        data = resp.json()
+    except Exception:
+        txt = resp.text or ""
+        return "EGW00201" in txt or "초당 거래건수" in txt
+    return _kis_json_payload_rate_limited(data)
 
 
 @dataclass
@@ -26,6 +46,9 @@ class KISApiClient:
         self.session = requests.Session()
         self.token: str = ""
         self.token_expire_at: Optional[datetime] = None
+        self._last_api_monotonic: float = 0.0
+        self._server_time_offset_sec: float = 0.0
+        self._server_time_offset_updated_at: float = 0.0
 
     def _token_is_valid(self) -> bool:
         return bool(self.token) and self.token_expire_at is not None and datetime.now() < self.token_expire_at
@@ -47,12 +70,52 @@ class KISApiClient:
             raise RuntimeError(
                 "KIS token request failed. Check APP_KEY/APP_SECRET, API 신청 상태, 접근 IP 허용 설정."
             ) from exc
+        self._update_server_time_offset_from_response(resp)
         data = resp.json()
         self.token = data["access_token"]
         self.token_expire_at = datetime.now() + timedelta(hours=23)
 
+    def server_time_offset_sec(self) -> float:
+        return float(self._server_time_offset_sec or 0.0)
+
+    def now_kst(self) -> datetime:
+        ts = time.time() + self.server_time_offset_sec()
+        return datetime.fromtimestamp(ts, tz=ZoneInfo("Asia/Seoul"))
+
+    def _update_server_time_offset_from_response(self, resp: requests.Response) -> None:
+        try:
+            date_hdr = (resp.headers or {}).get("Date", "")
+            if not date_hdr:
+                return
+            server_dt = parsedate_to_datetime(date_hdr)
+            if server_dt.tzinfo is None:
+                return
+            server_ts = server_dt.timestamp()
+            local_ts = time.time()
+            self._server_time_offset_sec = float(server_ts - local_ts)
+            self._server_time_offset_updated_at = local_ts
+        except Exception:
+            return
+
+    def _kis_retry_max(self) -> int:
+        return int(getattr(self.settings, "kis_api_retry_max", 8))
+
+    def _kis_rate_sleep(self) -> float:
+        return float(getattr(self.settings, "kis_rate_limit_retry_sleep_sec", 1.0))
+
+    def _pace_api(self) -> None:
+        gap = float(getattr(self.settings, "kis_min_request_interval_sec", 0.15))
+        if gap <= 0:
+            return
+        now = time.monotonic()
+        wait = gap - (now - self._last_api_monotonic)
+        if wait > 0:
+            time.sleep(wait)
+        self._last_api_monotonic = time.monotonic()
+
     def _headers(self, tr_id: str) -> Dict[str, str]:
         self.ensure_token()
+        self._pace_api()
         return {
             "authorization": f"Bearer {self.token}",
             "appkey": self.settings.app_key,
@@ -61,6 +124,45 @@ class KISApiClient:
             "custtype": "P",
             "content-type": "application/json",
         }
+
+    def _request_get_json(
+        self,
+        url: str,
+        *,
+        tr_id: str,
+        params: Dict[str, str],
+        error_prefix: str,
+    ) -> dict:
+        last_error: Optional[Exception] = None
+        for _ in range(self._kis_retry_max()):
+            try:
+                resp = self.session.get(
+                    url,
+                    headers=self._headers(tr_id=tr_id),
+                    params=params,
+                    timeout=self.settings.request_timeout_sec,
+                )
+                self._update_server_time_offset_from_response(resp)
+                if resp.status_code >= 400:
+                    if _response_is_rate_limited(resp):
+                        time.sleep(self._kis_rate_sleep())
+                        last_error = RuntimeError(_http_error_detail(resp))
+                        continue
+                    detail = _http_error_detail(resp)
+                    raise RuntimeError(f"{error_prefix}: {detail}")
+                data = resp.json()
+                if _kis_json_payload_rate_limited(data):
+                    time.sleep(self._kis_rate_sleep())
+                    last_error = RuntimeError("KIS rate limit in JSON body")
+                    continue
+                return data
+            except ValueError as exc:
+                last_error = exc
+                time.sleep(0.35)
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                time.sleep(0.35)
+        raise RuntimeError(f"{error_prefix}: retries exhausted ({last_error})") from last_error
 
     def get_cash_balance(self) -> int:
         """
@@ -77,18 +179,13 @@ class KISApiClient:
             "OVRS_ICLD_YN": "N",
         }
         tr_id = "VTTC8908R" if self.settings.is_paper_trading else "TTTC8908R"
-        resp = self.session.get(
-            url,
-            headers=self._headers(tr_id=tr_id),
-            params=params,
-            timeout=self.settings.request_timeout_sec,
+        data = self._request_get_json(
+            url, tr_id=tr_id, params=params, error_prefix="KIS CASH request failed"
         )
-        try:
-            resp.raise_for_status()
-        except requests.HTTPError as exc:
-            detail = _http_error_detail(resp)
-            raise RuntimeError(f"KIS CASH request failed: {detail}") from exc
-        data = resp.json()
+        rt = str(data.get("rt_cd", "0") or "0")
+        if rt not in ("", "0"):
+            msg = str(data.get("msg1", ""))
+            raise RuntimeError(f"KIS CASH business error(rt_cd={rt}): {msg}")
         return int(data["output"]["ord_psbl_cash"])
 
     def get_domestic_balance_summary(self) -> Dict[str, object]:
@@ -116,18 +213,12 @@ class KISApiClient:
             "CTX_AREA_NK100": "",
         }
         tr_id = "VTTC8434R" if self.settings.is_paper_trading else "TTTC8434R"
-        resp = self.session.get(
+        data = self._request_get_json(
             url,
-            headers=self._headers(tr_id=tr_id),
+            tr_id=tr_id,
             params=params,
-            timeout=self.settings.request_timeout_sec,
+            error_prefix="KIS balance summary request failed",
         )
-        try:
-            resp.raise_for_status()
-        except requests.HTTPError as exc:
-            detail = _http_error_detail(resp)
-            raise RuntimeError(f"KIS balance summary request failed: {detail}") from exc
-        data = resp.json()
         output2 = data.get("output2", {})
         if isinstance(output2, list):
             output2_row = output2[0] if output2 else {}
@@ -161,19 +252,12 @@ class KISApiClient:
             "CTX_AREA_NK100": "",
         }
         tr_id = "VTTC8434R" if self.settings.is_paper_trading else "TTTC8434R"
-        resp = self.session.get(
+        data = self._request_get_json(
             url,
-            headers=self._headers(tr_id=tr_id),
+            tr_id=tr_id,
             params=params,
-            timeout=self.settings.request_timeout_sec,
+            error_prefix="KIS balance positions request failed",
         )
-        try:
-            resp.raise_for_status()
-        except requests.HTTPError as exc:
-            detail = _http_error_detail(resp)
-            raise RuntimeError(f"KIS balance positions request failed: {detail}") from exc
-
-        data = resp.json()
         out = data.get("output1", [])
         if isinstance(out, dict):
             rows = [out]
@@ -209,7 +293,9 @@ class KISApiClient:
         url = f"{self.settings.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
         params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol}
         last_error: Optional[Exception] = None
-        for _ in range(self.settings.order_retry_count):
+        output: Optional[dict] = None
+        got_quote = False
+        for _ in range(self._kis_retry_max()):
             try:
                 resp = self.session.get(
                     url,
@@ -217,13 +303,28 @@ class KISApiClient:
                     params=params,
                     timeout=self.settings.request_timeout_sec,
                 )
+                self._update_server_time_offset_from_response(resp)
+                if resp.status_code >= 400 and _response_is_rate_limited(resp):
+                    time.sleep(self._kis_rate_sleep())
+                    last_error = RuntimeError(_http_error_detail(resp))
+                    continue
                 resp.raise_for_status()
-                output = resp.json()["output"]
+                body = resp.json()
+                if _kis_json_payload_rate_limited(body):
+                    time.sleep(self._kis_rate_sleep())
+                    last_error = RuntimeError("quote rate limited")
+                    continue
+                output = body["output"]
+                got_quote = True
                 break
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
-                time.sleep(0.5)
-        else:
+                resp = getattr(exc, "response", None)
+                if resp is not None and _response_is_rate_limited(resp):
+                    time.sleep(self._kis_rate_sleep())
+                else:
+                    time.sleep(0.5)
+        if not got_quote or output is None:
             raise RuntimeError(f"quote request failed for {symbol}: {last_error}") from last_error
 
         return Quote(
@@ -245,7 +346,8 @@ class KISApiClient:
         }
         rows: List[Dict[str, str]] = []
         last_error: Optional[Exception] = None
-        for _ in range(self.settings.order_retry_count):
+        got_response = False
+        for _ in range(self._kis_retry_max()):
             try:
                 resp = self.session.get(
                     url,
@@ -253,13 +355,28 @@ class KISApiClient:
                     params=params,
                     timeout=self.settings.request_timeout_sec,
                 )
+                self._update_server_time_offset_from_response(resp)
+                if resp.status_code >= 400 and _response_is_rate_limited(resp):
+                    time.sleep(self._kis_rate_sleep())
+                    last_error = RuntimeError(_http_error_detail(resp))
+                    continue
                 resp.raise_for_status()
-                rows = resp.json().get("output", [])[:days]
+                body = resp.json()
+                if _kis_json_payload_rate_limited(body):
+                    time.sleep(self._kis_rate_sleep())
+                    last_error = RuntimeError("daily-price rate limited")
+                    continue
+                rows = body.get("output", [])[:days]
+                got_response = True
                 break
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
-                time.sleep(0.5)
-        else:
+                resp = getattr(exc, "response", None)
+                if resp is not None and _response_is_rate_limited(resp):
+                    time.sleep(self._kis_rate_sleep())
+                else:
+                    time.sleep(0.5)
+        if not got_response:
             raise RuntimeError(f"daily-price request failed for {symbol}: {last_error}") from last_error
 
         parsed: List[Dict[str, int]] = []
@@ -338,6 +455,7 @@ class KISApiClient:
                     params=params,
                     timeout=self.settings.request_timeout_sec,
                 )
+                self._update_server_time_offset_from_response(resp)
                 resp.raise_for_status()
                 data = resp.json()
                 rt_cd = str(data.get("rt_cd", ""))
@@ -352,6 +470,9 @@ class KISApiClient:
                     return rows
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
+                resp = getattr(exc, "response", None)
+                if resp is not None and _response_is_rate_limited(resp):
+                    time.sleep(self._kis_rate_sleep())
                 continue
 
         raise RuntimeError(
@@ -369,18 +490,12 @@ class KISApiClient:
             "CTX_AREA_FK": "",
             "CTX_AREA_NK": "",
         }
-        resp = self.session.get(
+        data = self._request_get_json(
             url,
-            headers=self._headers("CTCA0903R"),
+            tr_id="CTCA0903R",
             params=params,
-            timeout=self.settings.request_timeout_sec,
+            error_prefix="KIS holiday request failed",
         )
-        try:
-            resp.raise_for_status()
-        except requests.HTTPError as exc:
-            detail = _http_error_detail(resp)
-            raise RuntimeError(f"KIS holiday request failed: {detail}") from exc
-        data = resp.json()
         output = data.get("output", [])
         if isinstance(output, dict):
             return [output]
@@ -404,22 +519,6 @@ class KISApiClient:
         if open_flag == "N":
             return False
         return None
-
-
-def _http_error_detail(resp: requests.Response) -> str:
-    status = getattr(resp, "status_code", None)
-    try:
-        body_ct = (resp.headers or {}).get("content-type", "")
-    except Exception:
-        body_ct = ""
-    preview = ""
-    try:
-        txt = resp.text or ""
-        txt = txt.replace("\r", " ").replace("\n", " ").strip()
-        preview = txt[:400]
-    except Exception:
-        preview = ""
-    return f"status={status} content_type={body_ct!s} body_preview={preview!s}"
 
     def place_limit_buy(self, symbol: str, qty: int, price: int) -> Dict[str, str]:
         url = f"{self.settings.base_url}/uapi/domestic-stock/v1/trading/order-cash"
@@ -449,7 +548,7 @@ def _http_error_detail(resp: requests.Response) -> str:
 
     def _post_order(self, url: str, body: Dict[str, str], tr_id: str) -> Dict[str, str]:
         last_error: Optional[Exception] = None
-        for _ in range(self.settings.order_retry_count):
+        for _ in range(self._kis_retry_max()):
             try:
                 resp = self.session.post(
                     url,
@@ -457,8 +556,17 @@ def _http_error_detail(resp: requests.Response) -> str:
                     json=body,
                     timeout=self.settings.request_timeout_sec,
                 )
+                self._update_server_time_offset_from_response(resp)
+                if resp.status_code >= 400 and _response_is_rate_limited(resp):
+                    time.sleep(self._kis_rate_sleep())
+                    last_error = RuntimeError(_http_error_detail(resp))
+                    continue
                 resp.raise_for_status()
                 data = resp.json()
+                if _kis_json_payload_rate_limited(data):
+                    time.sleep(self._kis_rate_sleep())
+                    last_error = RuntimeError("order rate limited")
+                    continue
                 return {
                     "rt_cd": data.get("rt_cd", ""),
                     "msg1": data.get("msg1", ""),
@@ -466,5 +574,25 @@ def _http_error_detail(resp: requests.Response) -> str:
                 }
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
-                time.sleep(0.7)
+                resp = getattr(exc, "response", None)
+                if resp is not None and _response_is_rate_limited(resp):
+                    time.sleep(self._kis_rate_sleep())
+                else:
+                    time.sleep(0.7)
         raise RuntimeError(f"order failed after retry: {last_error}") from last_error
+
+
+def _http_error_detail(resp: requests.Response) -> str:
+    status = getattr(resp, "status_code", None)
+    try:
+        body_ct = (resp.headers or {}).get("content-type", "")
+    except Exception:
+        body_ct = ""
+    preview = ""
+    try:
+        txt = resp.text or ""
+        txt = txt.replace("\r", " ").replace("\n", " ").strip()
+        preview = txt[:400]
+    except Exception:
+        preview = ""
+    return f"status={status} content_type={body_ct!s} body_preview={preview!s}"

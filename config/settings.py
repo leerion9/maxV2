@@ -35,9 +35,17 @@ class Settings:
     monitor_start_hhmm: str = "09:00"
     monitor_end_hhmm: str = "15:30"
     shutdown_hhmm: str = os.getenv("SHUTDOWN_HHMM", "15:40")
-    liquidation_hhmm: str = "09:00"
+    liquidation_hhmm: str = "08:55"
 
     order_retry_count: int = 3
+    # KIS OpenAPI: burst 호출 시 "초당 거래건수 초과"(EGW00201) 방지
+    kis_min_request_interval_sec: float = float(
+        os.getenv("KIS_MIN_REQUEST_INTERVAL_SEC", "0.15") or "0.15"
+    )
+    kis_rate_limit_retry_sleep_sec: float = float(
+        os.getenv("KIS_RATE_LIMIT_RETRY_SLEEP_SEC", "1.0") or "1.0"
+    )
+    kis_api_retry_max: int = int(os.getenv("KIS_API_RETRY_MAX", "8") or "8")
     request_timeout_sec: int = 8
     poll_interval_sec: int = 2
     heartbeat_sec: int = int(os.getenv("HEARTBEAT_SEC", "600") or "600")

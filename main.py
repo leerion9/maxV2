@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import date, datetime
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List
 from zoneinfo import ZoneInfo
-
-import schedule
 
 from config.settings import settings
 from core.api_client import KISApiClient
@@ -17,6 +16,17 @@ from core.symbol_resolver import SymbolResolver
 from core.strategy import VolatilityBreakoutStrategy
 from core.universe import UniverseBuilder
 from core.universe_cache import CachedSymbol, UniverseCache, cache_path, load_cache, save_cache, today_kst_yyyymmdd
+
+
+@dataclass
+class PendingOrder:
+    created_ts: float
+    symbol: str
+    side: str  # BUY|SELL
+    qty: int
+    ord_no: str
+    before_qty: int
+    deadline_ts: float
 
 
 class MaxVRunner:
@@ -51,48 +61,103 @@ class MaxVRunner:
         self._market_holiday_set = self._parse_yyyymmdd_list(settings.market_holidays)
         self._market_extra_open_set = self._parse_yyyymmdd_list(settings.market_extra_open_days)
         self._trading_day_cache: Dict[str, bool] = {}
+        self._did_prepare_ymd: str = ""
+        self._did_liquidate_ymd: str = ""
+        self._did_close_ymd: str = ""
+        self._last_monitor_ts: float = 0.0
+        self._pending_orders: List[PendingOrder] = []
 
     def run(self) -> None:
         self._configure_console_utf8()
-        self.logger.info("MaxV scheduler started.")
-        schedule.every().day.at("08:30").do(self.prepare_universe)
-        schedule.every().day.at(settings.liquidation_hhmm).do(self.liquidate_previous_positions)
-        schedule.every(settings.poll_interval_sec).seconds.do(self.monitor_intraday)
-        schedule.every().day.at("15:30").do(self.on_close)
-        schedule.every().day.at(settings.shutdown_hhmm).do(self.request_shutdown)
+        self.logger.info("MaxV started.")
 
         # Candidate list uses prior session OHLCV only; safe after the open.
         # Run once on startup on a weekday so a late start still gets today's watch list.
         if self._is_krx_weekday():
             self.prepare_universe()
+            self._did_prepare_ymd = self._now_kst().strftime("%Y%m%d")
             self._sync_bought_symbols_from_positions()
             self._liquidate_non_today_holdings_on_startup_if_needed()
         else:
             self.logger.info("Weekend (KST); skip initial universe prep. Will run at next 08:30 on a weekday.")
 
         while not self._should_stop:
-            schedule.run_pending()
-            time.sleep(0.5)
-        self.logger.info("MaxV scheduler stopped.")
+            self._tick()
+            time.sleep(0.25)
+        self.logger.info("MaxV stopped.")
 
     @staticmethod
     def _is_krx_weekday() -> bool:
         """Mon-Fri in Asia/Seoul. Does not exclude exchange holidays."""
         return datetime.now(ZoneInfo("Asia/Seoul")).weekday() < 5
 
-    @staticmethod
-    def _now_kst() -> datetime:
-        return datetime.now(ZoneInfo("Asia/Seoul"))
+    def _now_kst(self) -> datetime:
+        try:
+            return self.api.now_kst()
+        except Exception:
+            return datetime.now(ZoneInfo("Asia/Seoul"))
+
+    def _tick(self) -> None:
+        now = self._now_kst()
+        ymd = now.strftime("%Y%m%d")
+        hhmm = now.strftime("%H:%M")
+
+        self._reconcile_pending_orders()
+
+        if (
+            self._is_krx_weekday()
+            and hhmm >= "08:30"
+            and hhmm <= "09:10"
+            and self._did_prepare_ymd != ymd
+        ):
+            self.prepare_universe()
+            self._did_prepare_ymd = ymd
+
+        if (
+            self._is_krx_weekday()
+            and hhmm >= settings.liquidation_hhmm
+            and hhmm <= "09:10"
+            and self._did_liquidate_ymd != ymd
+        ):
+            self.liquidate_previous_positions()
+            self._did_liquidate_ymd = ymd
+
+        if hhmm >= "15:30" and self._did_close_ymd != ymd:
+            self.on_close()
+            self._did_close_ymd = ymd
+
+        if hhmm >= settings.shutdown_hhmm:
+            self.request_shutdown()
+            return
+
+        if self._is_krx_weekday():
+            now_ts = time.time()
+            if now_ts - self._last_monitor_ts >= settings.poll_interval_sec:
+                self._last_monitor_ts = now_ts
+                self.monitor_intraday()
 
     @staticmethod
     def _configure_console_utf8() -> None:
         try:
             import sys
+            import os
+            import platform
+
+            os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
             if hasattr(sys.stdout, "reconfigure"):
                 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
             if hasattr(sys.stderr, "reconfigure"):
                 sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+            if platform.system().lower() == "windows":
+                try:
+                    import ctypes
+
+                    ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+                    ctypes.windll.kernel32.SetConsoleCP(65001)
+                except Exception:
+                    pass
         except Exception:
             return
 
@@ -309,20 +374,55 @@ class MaxVRunner:
                 "Will retry at next trading day open."
             )
             return
-        self.logger.info("Liquidating previous positions at open...")
+        today = today_kst_yyyymmdd(now_kst)
+        yesterday = self._yesterday_kst_yyyymmdd(now_kst)
+        payload = self._load_positions_payload()
+        if payload.get("date_kst") != yesterday:
+            self.logger.info(
+                f"Liquidation skipped: positions date_kst={payload.get('date_kst','')} "
+                f"(expected_yesterday={yesterday})"
+            )
+            return
+        raw_positions = payload.get("positions", {}) if isinstance(payload.get("positions", {}), dict) else {}
+        prev_syms = {str(sym) for sym, qty in raw_positions.items() if int(qty or 0) > 0}
+        if not prev_syms:
+            self.logger.info("Liquidation skipped: no previous-day positions in positions.json")
+            return
+
         holdings = self._get_holdings_with_cache(force_refresh=True)
-        if not holdings:
-            self.logger.info("No holdings detected; liquidation skipped.")
-            self._save_positions({"date_kst": today_kst_yyyymmdd(), "positions": {}})
+        holdings_by_symbol = {str(r.get("symbol", "")).strip(): r for r in holdings if isinstance(r, dict)}
+        to_sell: List[Dict[str, object]] = []
+        for sym in sorted(prev_syms):
+            row = holdings_by_symbol.get(sym)
+            if not row:
+                continue
+            qty = int(row.get("qty", 0) or 0)
+            if qty <= 0:
+                continue
+            to_sell.append({"symbol": sym, "qty": qty, "name": row.get("name", "")})
+
+        if not to_sell:
+            self.logger.info("Liquidation skipped: no matching holdings for previous-day positions")
+            self._save_positions({"date_kst": today, "positions": {}})
             self.bought_symbols.clear()
             return
-        for row in holdings:
-            symbol = str(row.get("symbol", "")).strip()
-            qty = int(row.get("qty", 0) or 0)
-            if not symbol or qty <= 0:
-                continue
+
+        self.logger.info(
+            f"Liquidating previous-day positions at {settings.liquidation_hhmm} (KST): "
+            f"count={len(to_sell)}"
+        )
+        for row in to_sell:
+            symbol = str(row["symbol"])
+            qty = int(row["qty"])
             name = self.symbols.get_name(symbol, fetch=True) or str(row.get("name", "") or "").strip()
-            result = self.order.place_open_liquidation(symbol=symbol, qty=qty)
+            before_qty = self._get_holding_qty(symbol)
+            try:
+                result = self.order.place_open_liquidation(symbol=symbol, qty=qty)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.error(f"SELL submit failed {symbol}: {exc}")
+                continue
+            ord_no = str(result.get("ord_no", "") or "")
+            self._add_pending_order(symbol=symbol, side="SELL", qty=qty, ord_no=ord_no, before_qty=before_qty)
             cash_psbl = self._get_cash_with_cache(force_refresh=True)
             bal = self._get_balance_summary_safely()
             self.logger.log_trade(
@@ -332,20 +432,21 @@ class MaxVRunner:
                     "side": "SELL",
                     "qty": qty,
                     "price": 0,
-                    "reason": "next_day_open_liquidation",
+                    "reason": "next_day_0855_liquidation",
                     "fee": "",
                     "tax": "",
-                    "order_id": result.get("ord_no", ""),
+                    "order_id": ord_no,
                     "cash_psbl": cash_psbl,
                     **bal,
                 }
             )
             self.logger.info(
-                f"[매도요청] {name or ''}({symbol}) qty={qty} 시장가(시가청산) "
-                f"ord_no={result.get('ord_no','')} cash_psbl={cash_psbl}"
+                f"[매도요청] {name or ''}({symbol}) qty={qty} 시장가(08:55 청산) "
+                f"ord_no={ord_no} cash_psbl={cash_psbl}"
             )
-        self._save_positions({"date_kst": today_kst_yyyymmdd(), "positions": {}})
-        time.sleep(2)
+            time.sleep(0.55)
+
+        self._save_positions({"date_kst": today, "positions": {}})
         self.bought_symbols.clear()
 
     def _sync_bought_symbols_from_positions(self) -> None:
@@ -367,9 +468,14 @@ class MaxVRunner:
 
         today = today_kst_yyyymmdd()
         payload = self._load_positions_payload()
-        today_positions: Dict[str, int] = {}
-        if payload.get("date_kst") == today and isinstance(payload.get("positions", {}), dict):
-            today_positions = {str(k): int(v) for k, v in payload.get("positions", {}).items()}
+        raw_positions = payload.get("positions", {}) if isinstance(payload.get("positions", {}), dict) else {}
+        if payload.get("date_kst") == today:
+            return
+        if payload.get("date_kst") != self._yesterday_kst_yyyymmdd(now):
+            return
+        prev_syms = {str(sym) for sym, qty in raw_positions.items() if int(qty or 0) > 0}
+        if not prev_syms:
+            return
 
         holdings = self._get_holdings_with_cache(force_refresh=True)
         to_sell: List[Dict[str, object]] = []
@@ -378,7 +484,7 @@ class MaxVRunner:
             qty = int(row.get("qty", 0) or 0)
             if not symbol or qty <= 0:
                 continue
-            if symbol in today_positions:
+            if symbol not in prev_syms:
                 continue
             to_sell.append({"symbol": symbol, "qty": qty, "name": row.get("name", "")})
 
@@ -387,13 +493,20 @@ class MaxVRunner:
 
         self.logger.info(
             f"Startup liquidation triggered (now={now_hhmm} KST): "
-            f"selling non-today holdings={len(to_sell)}"
+            f"selling previous-day positions={len(to_sell)}"
         )
         for row in to_sell:
             symbol = str(row["symbol"])
             qty = int(row["qty"])
             name = self.symbols.get_name(symbol, fetch=True) or str(row.get("name", "") or "").strip()
-            result = self.order.place_open_liquidation(symbol=symbol, qty=qty)
+            before_qty = self._get_holding_qty(symbol)
+            try:
+                result = self.order.place_open_liquidation(symbol=symbol, qty=qty)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.error(f"SELL submit failed {symbol}: {exc}")
+                continue
+            ord_no = str(result.get("ord_no", "") or "")
+            self._add_pending_order(symbol=symbol, side="SELL", qty=qty, ord_no=ord_no, before_qty=before_qty)
             cash_psbl = self._get_cash_with_cache(force_refresh=True)
             bal = self._get_balance_summary_safely()
             self.logger.log_trade(
@@ -403,21 +516,21 @@ class MaxVRunner:
                     "side": "SELL",
                     "qty": qty,
                     "price": 0,
-                    "reason": "startup_non_today_liquidation",
+                    "reason": "startup_previous_day_liquidation",
                     "fee": "",
                     "tax": "",
-                    "order_id": result.get("ord_no", ""),
+                    "order_id": ord_no,
                     "cash_psbl": cash_psbl,
                     **bal,
                 }
             )
             self.logger.info(
                 f"[매도요청] {name or ''}({symbol}) qty={qty} 시장가(시작즉시청산) "
-                f"ord_no={result.get('ord_no','')} cash_psbl={cash_psbl}"
+                f"ord_no={ord_no} cash_psbl={cash_psbl}"
             )
-            time.sleep(0.2)
+            time.sleep(0.55)
 
-        self._save_positions({"date_kst": today, "positions": today_positions})
+        self._save_positions({"date_kst": today, "positions": {}})
         self._sync_bought_symbols_from_positions()
 
     def _get_balance_summary_safely(self) -> Dict[str, object]:
@@ -550,6 +663,9 @@ class MaxVRunner:
                 continue
 
             qty = self.order.calc_buy_qty(cash=cash, breakout_price=signal.breakout_price)
+            before_qty = self._get_holding_qty(symbol)
+            ord_no = str(result.get("ord_no", "") or "")
+            self._add_pending_order(symbol=symbol, side="BUY", qty=qty, ord_no=ord_no, before_qty=before_qty)
             self.bought_symbols.add(symbol)
             positions = self._load_positions()
             positions[symbol] = qty
@@ -568,14 +684,14 @@ class MaxVRunner:
                     "reason": signal.reason,
                     "fee": "",
                     "tax": "",
-                    "order_id": result.get("ord_no", ""),
+                    "order_id": ord_no,
                     "cash_psbl": cash_psbl_after,
                     **bal,
                 }
             )
             self.logger.info(
                 f"[매수] {name or ''}({symbol}) price={signal.breakout_price} qty={qty} "
-                f"ord_no={result.get('ord_no','')} cash_psbl={cash_psbl_after}"
+                f"ord_no={ord_no} cash_psbl={cash_psbl_after}"
             )
             cash = self._get_cash_with_cache(force_refresh=True)
             cycle_buys += 1
@@ -670,6 +786,68 @@ class MaxVRunner:
     def _get_holdings_count_with_cache(self) -> int:
         _ = self._get_holdings_with_cache()
         return int(self.cached_holdings_count or 0)
+
+    def _get_holding_qty(self, symbol: str) -> int:
+        try:
+            rows = self._get_holdings_with_cache(force_refresh=True)
+            for r in rows:
+                if str(r.get("symbol", "")).strip() == str(symbol).strip():
+                    return int(r.get("qty", 0) or 0)
+        except Exception:
+            return 0
+        return 0
+
+    @staticmethod
+    def _yesterday_kst_yyyymmdd(now_kst: datetime) -> str:
+        return (now_kst.date() - timedelta(days=1)).strftime("%Y%m%d")
+
+    def _add_pending_order(self, *, symbol: str, side: str, qty: int, ord_no: str, before_qty: int) -> None:
+        if not ord_no:
+            self.logger.error(f"Order ACK missing ord_no: {side} {symbol} qty={qty}")
+            return
+        now_ts = time.time()
+        self._pending_orders.append(
+            PendingOrder(
+                created_ts=now_ts,
+                symbol=symbol,
+                side=side,
+                qty=int(qty or 0),
+                ord_no=ord_no,
+                before_qty=int(before_qty or 0),
+                deadline_ts=now_ts + 30.0,
+            )
+        )
+
+    def _reconcile_pending_orders(self) -> None:
+        if not self._pending_orders:
+            return
+        now_ts = time.time()
+        remaining: List[PendingOrder] = []
+        for po in self._pending_orders:
+            current_qty = self._get_holding_qty(po.symbol)
+            confirmed = False
+            if po.side == "BUY":
+                confirmed = current_qty >= (po.before_qty + po.qty)
+            elif po.side == "SELL":
+                confirmed = current_qty <= max(0, po.before_qty - po.qty)
+
+            if confirmed:
+                self.logger.info(
+                    f"[주문확인] {po.side} {po.symbol} ord_no={po.ord_no} "
+                    f"before_qty={po.before_qty} now_qty={current_qty}"
+                )
+                continue
+
+            if now_ts >= po.deadline_ts:
+                self.logger.error(
+                    f"[주문미확정] {po.side} {po.symbol} ord_no={po.ord_no} "
+                    f"before_qty={po.before_qty} now_qty={current_qty} "
+                    "잔고 반영으로 체결/미체결을 확정하지 못했습니다. KIS 주문/체결조회로 확인이 필요합니다."
+                )
+                continue
+
+            remaining.append(po)
+        self._pending_orders = remaining
 
 
 if __name__ == "__main__":
