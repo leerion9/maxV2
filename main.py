@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 from zoneinfo import ZoneInfo
@@ -14,7 +13,6 @@ from core.logger import TradeLogger
 from core.order import OrderManager
 from core.symbol_resolver import SymbolResolver
 from core.strategy import VolatilityBreakoutStrategy
-from core.universe import UniverseBuilder
 from core.universe_cache import CachedSymbol, UniverseCache, cache_path, load_cache, save_cache, today_kst_yyyymmdd
 
 
@@ -38,13 +36,12 @@ class MaxVRunner:
         self.api = KISApiClient(settings=settings)
         self.logger = TradeLogger(log_dir=settings.log_dir)
         self.order = OrderManager(api=self.api, settings=settings)
-        self.universe_builder = UniverseBuilder(api=self.api, top_ratio=settings.top_market_cap_ratio)
         self.strategy = VolatilityBreakoutStrategy()
         self.symbols = SymbolResolver()
 
-        # cwd와 무관하게 항상 이 프로젝트의 data/positions.json만 사용 (실행 위치에 따라 파일이 갈라지는 문제 방지)
-        self.positions_file = _REPO_ROOT / "data" / "positions.json"
         self.today_universe: List[str] = []
+        # Running set of symbols we should never buy again during this process.
+        # On (re)start we seed it from current account holdings.
         self.bought_symbols: set[str] = set()
         self.cached_cash: int = 0
         self.cash_updated_at: float = 0.0
@@ -62,29 +59,33 @@ class MaxVRunner:
         self._hb_buys: int = 0
         self._hb_skipped_signals: int = 0
         self._should_stop: bool = False
-        self._market_holiday_set = self._parse_yyyymmdd_list(settings.market_holidays)
-        self._market_extra_open_set = self._parse_yyyymmdd_list(settings.market_extra_open_days)
-        self._trading_day_cache: Dict[str, bool] = {}
         self._did_prepare_ymd: str = ""
         self._did_liquidate_ymd: str = ""
-        self._did_close_ymd: str = ""
         self._last_monitor_ts: float = 0.0
         self._pending_orders: List[PendingOrder] = []
 
     def run(self) -> None:
         self._configure_console_utf8()
         self.logger.info("MaxV started.")
-        self.logger.info(f"positions.json 절대경로: {self.positions_file.resolve()}")
+        self._seed_bought_symbols_from_holdings()
 
-        # Candidate list uses prior session OHLCV only; safe after the open.
-        # Run once on startup on a weekday so a late start still gets today's watch list.
-        if self._is_krx_weekday():
+        now = self._now_kst_local()
+        hhmm = now.strftime("%H:%M")
+        if hhmm >= "15:30":
+            print("장 종료 이후 시간입니다.")
+            self.logger.info("장 종료 이후 시간입니다.")
+            return
+
+        # 3-phase startup:
+        # - 00:00~08:49: universe prep, then wait; at 08:50 liquidate all holdings.
+        # - 08:50~15:30: no auto-sell; resume monitoring (load cache if exists; otherwise build).
+        if hhmm < settings.liquidation_hhmm:
             self.prepare_universe()
-            self._did_prepare_ymd = self._now_kst().strftime("%Y%m%d")
-            self._sync_bought_symbols_from_positions()
-            self._liquidate_non_today_holdings_on_startup_if_needed()
+            self._did_prepare_ymd = now.strftime("%Y%m%d")
         else:
-            self.logger.info("Weekend (KST); skip initial universe prep. Will run at next 08:30 on a weekday.")
+            # Intraday start: try cache first, otherwise build.
+            self.prepare_universe()
+            self._did_prepare_ymd = now.strftime("%Y%m%d")
 
         while not self._should_stop:
             self._tick()
@@ -92,54 +93,30 @@ class MaxVRunner:
         self.logger.info("MaxV stopped.")
 
     @staticmethod
-    def _is_krx_weekday() -> bool:
-        """Mon-Fri in Asia/Seoul. Does not exclude exchange holidays."""
-        return datetime.now(ZoneInfo("Asia/Seoul")).weekday() < 5
-
-    def _now_kst(self) -> datetime:
-        try:
-            return self.api.now_kst()
-        except Exception:
-            return datetime.now(ZoneInfo("Asia/Seoul"))
+    def _now_kst_local() -> datetime:
+        # User operates this bot on KST local time.
+        return datetime.now(ZoneInfo("Asia/Seoul"))
 
     def _tick(self) -> None:
-        now = self._now_kst()
+        now = self._now_kst_local()
         ymd = now.strftime("%Y%m%d")
         hhmm = now.strftime("%H:%M")
 
         self._reconcile_pending_orders()
 
-        if (
-            self._is_krx_weekday()
-            and hhmm >= "08:30"
-            and hhmm <= "09:10"
-            and self._did_prepare_ymd != ymd
-        ):
-            self.prepare_universe()
-            self._did_prepare_ymd = ymd
-
-        if (
-            self._is_krx_weekday()
-            and hhmm >= settings.liquidation_hhmm
-            and hhmm <= "09:10"
-            and self._did_liquidate_ymd != ymd
-        ):
-            self.liquidate_previous_positions()
+        # Pre-open liquidation: sell all holdings once at 08:50.
+        if hhmm >= settings.liquidation_hhmm and self._did_liquidate_ymd != ymd:
+            self.liquidate_all_holdings_at_open()
             self._did_liquidate_ymd = ymd
-
-        if hhmm >= "15:30" and self._did_close_ymd != ymd:
-            self.on_close()
-            self._did_close_ymd = ymd
 
         if hhmm >= settings.shutdown_hhmm:
             self.request_shutdown()
             return
 
-        if self._is_krx_weekday():
-            now_ts = time.time()
-            if now_ts - self._last_monitor_ts >= settings.poll_interval_sec:
-                self._last_monitor_ts = now_ts
-                self.monitor_intraday()
+        now_ts = time.time()
+        if now_ts - self._last_monitor_ts >= settings.poll_interval_sec:
+            self._last_monitor_ts = now_ts
+            self.monitor_intraday()
 
     @staticmethod
     def _configure_console_utf8() -> None:
@@ -166,49 +143,21 @@ class MaxVRunner:
         except Exception:
             return
 
-    @staticmethod
-    def _parse_yyyymmdd_list(raw: str) -> set[str]:
-        out: set[str] = set()
-        for token in raw.split(","):
-            t = token.strip()
-            if len(t) == 8 and t.isdigit():
-                out.add(t)
-        return out
-
-    def _is_krx_trading_day(self, day: date | None = None) -> bool:
-        now_day = day or self._now_kst().date()
-        ymd = now_day.strftime("%Y%m%d")
-        if ymd in self._market_extra_open_set:
-            return True
-        if ymd in self._market_holiday_set:
-            return False
-        cached = self._trading_day_cache.get(ymd)
-        if cached is not None:
-            return cached
-
+    def _seed_bought_symbols_from_holdings(self) -> None:
+        """
+        On restart, we must not re-buy symbols already held.
+        We seed bought_symbols from current account holdings once at startup.
+        """
         try:
-            api_open = self.api.is_open_trading_day(base_date_yyyymmdd=ymd)
-            if api_open is not None:
-                self._trading_day_cache[ymd] = api_open
-                return api_open
-            try:
-                rows = self.api.get_holiday_info(base_date_yyyymmdd=ymd)
-                raw_preview = json.dumps(rows, ensure_ascii=False)[:1200]
-                self.logger.error(
-                    f"KIS holiday payload parse failed for {ymd}; "
-                    f"raw_preview={raw_preview}; fallback to weekday rule."
+            rows = self._get_holdings_with_cache(force_refresh=True)
+            syms = {str(r.get("symbol", "")).strip() for r in rows if isinstance(r, dict)}
+            self.bought_symbols = {s for s in syms if s}
+            if self.bought_symbols:
+                self.logger.info(
+                    f"보유 종목 감지: {len(self.bought_symbols)}종목 (재매수 방지용)"
                 )
-            except Exception as exc:  # noqa: BLE001
-                self.logger.error(
-                    f"KIS holiday payload parse failed for {ymd}; also failed to fetch raw: {exc}; "
-                    "fallback to weekday rule."
-                )
-        except Exception as exc:  # noqa: BLE001
-            self.logger.error(f"KIS holiday check failed for {ymd}: {exc}; fallback to weekday rule.")
-
-        is_weekday = now_day.weekday() < 5
-        self._trading_day_cache[ymd] = is_weekday
-        return is_weekday
+        except Exception:
+            self.bought_symbols = set()
 
     def _maybe_heartbeat(self, phase: str, message: str) -> bool:
         now_ts = time.time()
@@ -230,7 +179,7 @@ class MaxVRunner:
     def prepare_universe(self) -> None:
         self.logger.info("Preparing universe...")
 
-        cache_date = today_kst_yyyymmdd(self._now_kst())
+        cache_date = today_kst_yyyymmdd(self._now_kst_local())
         ucache_path = cache_path(Path("data"), cache_date)
         cache = load_cache(ucache_path)
 
@@ -249,7 +198,7 @@ class MaxVRunner:
                 f"Universe cache hit: {ucache_path.name} ({len(symbols)} symbols)"
             )
 
-        if not symbols and settings.universe_source in {"naver", "naver_then_kis"}:
+        if not symbols:
             try:
                 from core.naver_universe import build_naver_universe_with_features
 
@@ -291,16 +240,8 @@ class MaxVRunner:
                 self.logger.info(f"Universe cache saved: {ucache_path.name}")
             except Exception as exc:  # noqa: BLE001
                 self.logger.error(f"Naver universe build failed: {exc}")
-                if settings.universe_source == "naver":
-                    symbols = []
-                    features = {}
-
-        if not symbols and settings.universe_source in {"kis", "naver_then_kis"}:
-            try:
-                symbols = self.universe_builder.build()
-            except Exception as exc:  # noqa: BLE001
-                self.logger.error(f"KIS universe build failed: {exc}")
                 symbols = []
+                features = {}
 
         self.today_universe = symbols
         self.strategy = VolatilityBreakoutStrategy()
@@ -347,166 +288,33 @@ class MaxVRunner:
             f"{settings.monitor_start_hhmm}~{settings.monitor_end_hhmm} (KST) 구간에서 감시합니다. "
             f"(poll={settings.poll_interval_sec}s, heartbeat={settings.heartbeat_sec}s)"
         )
-
-        if settings.compare_universe_naver:
-            try:
-                from core.naver_universe import build_naver_universe, format_symbol_diff
-
-                self.logger.info("Naver universe compare starting (scraping; may take ~1-2 min)...")
-                naver_syms, _st = build_naver_universe(
-                    top_ratio=settings.top_market_cap_ratio,
-                    delay_sec=settings.naver_http_delay_sec,
-                )
-                ok, on = format_symbol_diff(symbols, naver_syms, limit=50)
-                self.logger.info(
-                    "Universe compare KIS vs Naver: "
-                    f"KIS={len(symbols)} Naver={len(naver_syms)} "
-                    f"only_KIS={len(set(symbols) - set(naver_syms))} "
-                    f"only_Naver={len(set(naver_syms) - set(symbols))}"
-                )
-                if ok:
-                    self.logger.info(f"only_KIS (sample): {ok}")
-                if on:
-                    self.logger.info(f"only_Naver (sample): {on}")
-            except Exception as exc:  # noqa: BLE001
-                self.logger.error(f"Naver universe compare failed: {exc}")
-
-    def liquidate_previous_positions(self) -> None:
-        now_kst = self._now_kst()
-        if not self._is_krx_trading_day(now_kst.date()):
-            self.logger.info(
-                f"Skip liquidation: non-trading day ({now_kst.strftime('%Y-%m-%d')} KST). "
-                "Will retry at next trading day open."
-            )
-            return
-        today = today_kst_yyyymmdd(now_kst)
-        prior_session = self._prior_trading_session_kst_yyyymmdd(now_kst)
-        payload = self._load_positions_payload()
-        if payload.get("date_kst") != prior_session:
-            self.logger.info(
-                f"Liquidation skipped: positions date_kst={payload.get('date_kst','')} "
-                f"(expected_prior_session={prior_session})"
-            )
-            return
-        raw_positions = payload.get("positions", {}) if isinstance(payload.get("positions", {}), dict) else {}
-        prev_syms = {str(sym) for sym, qty in raw_positions.items() if int(qty or 0) > 0}
-        if not prev_syms:
-            acct_n = self._get_holdings_count_with_cache()
-            self.logger.warning(
-                "청산 스킵: positions.json에 전일(직전 영업일) 매수 종목이 비어 있음 — "
-                f"expected_prior_session={prior_session}, 계좌보유={acct_n}종목, "
-                f"file={self.positions_file.resolve()} "
-                "(실행 cwd가 바뀌면 예전에는 다른 경로의 JSON을 읽었을 수 있습니다)."
-            )
-            self._save_positions({"date_kst": today, "positions": {}})
-            self._sync_bought_symbols_from_positions()
-            return
-
-        holdings = self._get_holdings_with_cache(force_refresh=True)
-        holdings_by_symbol = {str(r.get("symbol", "")).strip(): r for r in holdings if isinstance(r, dict)}
-        to_sell: List[Dict[str, object]] = []
-        for sym in sorted(prev_syms):
-            row = holdings_by_symbol.get(sym)
-            if not row:
-                continue
-            qty = int(row.get("qty", 0) or 0)
-            if qty <= 0:
-                continue
-            to_sell.append({"symbol": sym, "qty": qty, "name": row.get("name", "")})
-
-        if not to_sell:
-            self.logger.info("Liquidation skipped: no matching holdings for previous-day positions")
-            self._save_positions({"date_kst": today, "positions": {}})
-            self.bought_symbols.clear()
-            return
-
-        self.logger.info(
-            f"Liquidating previous-day positions at {settings.liquidation_hhmm} (KST): "
-            f"count={len(to_sell)}"
-        )
-        for row in to_sell:
-            symbol = str(row["symbol"])
-            qty = int(row["qty"])
-            name = self.symbols.get_name(symbol, fetch=True) or str(row.get("name", "") or "").strip()
-            before_qty = self._get_holding_qty(symbol)
-            try:
-                result = self.order.place_open_liquidation(symbol=symbol, qty=qty)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.error(f"SELL submit failed {symbol}: {exc}")
-                continue
-            ord_no = str(result.get("ord_no", "") or "")
-            self._add_pending_order(symbol=symbol, side="SELL", qty=qty, ord_no=ord_no, before_qty=before_qty)
-            cash_psbl = self._get_cash_with_cache(force_refresh=True)
-            bal = self._get_balance_summary_safely()
-            self.logger.log_trade(
-                {
-                    "symbol": symbol,
-                    "symbol_name": name,
-                    "side": "SELL",
-                    "qty": qty,
-                    "price": 0,
-                    "reason": "next_day_0855_liquidation",
-                    "fee": "",
-                    "tax": "",
-                    "order_id": ord_no,
-                    "cash_psbl": cash_psbl,
-                    **bal,
-                }
-            )
-            self.logger.info(
-                f"[매도요청] {name or ''}({symbol}) qty={qty} 시장가(08:55 청산) "
-                f"ord_no={ord_no} cash_psbl={cash_psbl}"
-            )
-            time.sleep(0.55)
-
-        self._save_positions({"date_kst": today, "positions": {}})
-        self.bought_symbols.clear()
-
-    def _sync_bought_symbols_from_positions(self) -> None:
-        today = today_kst_yyyymmdd(self._now_kst())
-        payload = self._load_positions_payload()
-        if payload.get("date_kst") != today:
-            self.bought_symbols = set()
-            return
-        positions = payload.get("positions", {}) if isinstance(payload.get("positions", {}), dict) else {}
-        self.bought_symbols = {str(sym) for sym, qty in positions.items() if int(qty or 0) > 0}
-
-    def _liquidate_non_today_holdings_on_startup_if_needed(self) -> None:
-        now = self._now_kst()
-        if not self._is_krx_trading_day(now.date()):
-            return
+    def liquidate_all_holdings_at_open(self) -> None:
+        """
+        Pre-open liquidation at 08:50 (KST): sell all current holdings.
+        We intentionally do NOT check "previous-day buy" or holidays.
+        """
+        now = self._now_kst_local()
         now_hhmm = now.strftime("%H:%M")
         if now_hhmm < settings.liquidation_hhmm:
-            return
-
-        today = today_kst_yyyymmdd(self._now_kst())
-        payload = self._load_positions_payload()
-        raw_positions = payload.get("positions", {}) if isinstance(payload.get("positions", {}), dict) else {}
-        if payload.get("date_kst") == today:
-            return
-        if payload.get("date_kst") != self._prior_trading_session_kst_yyyymmdd(now):
-            return
-        prev_syms = {str(sym) for sym, qty in raw_positions.items() if int(qty or 0) > 0}
-        if not prev_syms:
             return
 
         holdings = self._get_holdings_with_cache(force_refresh=True)
         to_sell: List[Dict[str, object]] = []
         for row in holdings:
+            if not isinstance(row, dict):
+                continue
             symbol = str(row.get("symbol", "")).strip()
             qty = int(row.get("qty", 0) or 0)
             if not symbol or qty <= 0:
                 continue
-            if symbol not in prev_syms:
-                continue
             to_sell.append({"symbol": symbol, "qty": qty, "name": row.get("name", "")})
 
         if not to_sell:
+            self.logger.info(f"08:50 청산: 보유 종목 없음 (now={now_hhmm} KST)")
             return
 
         self.logger.info(
-            f"Startup liquidation triggered (now={now_hhmm} KST): "
-            f"selling previous-day positions={len(to_sell)}"
+            f"08:50 청산(보유 전량): now={now_hhmm} KST count={len(to_sell)}"
         )
         for row in to_sell:
             symbol = str(row["symbol"])
@@ -519,7 +327,9 @@ class MaxVRunner:
                 self.logger.error(f"SELL submit failed {symbol}: {exc}")
                 continue
             ord_no = str(result.get("ord_no", "") or "")
-            self._add_pending_order(symbol=symbol, side="SELL", qty=qty, ord_no=ord_no, before_qty=before_qty)
+            self._add_pending_order(
+                symbol=symbol, side="SELL", qty=qty, ord_no=ord_no, before_qty=before_qty
+            )
             cash_psbl = self._get_cash_with_cache(force_refresh=True)
             bal = self._get_balance_summary_safely()
             self.logger.log_trade(
@@ -529,7 +339,7 @@ class MaxVRunner:
                     "side": "SELL",
                     "qty": qty,
                     "price": 0,
-                    "reason": "startup_previous_day_liquidation",
+                    "reason": "open_0850_liquidation_all",
                     "fee": "",
                     "tax": "",
                     "order_id": ord_no,
@@ -538,13 +348,10 @@ class MaxVRunner:
                 }
             )
             self.logger.info(
-                f"[매도요청] {name or ''}({symbol}) qty={qty} 시장가(시작즉시청산) "
+                f"[매도요청] {name or ''}({symbol}) qty={qty} 시장가(08:50 보유전량청산) "
                 f"ord_no={ord_no} cash_psbl={cash_psbl}"
             )
             time.sleep(0.55)
-
-        self._save_positions({"date_kst": today, "positions": {}})
-        self._sync_bought_symbols_from_positions()
 
     def _get_balance_summary_safely(self) -> Dict[str, object]:
         try:
@@ -562,13 +369,7 @@ class MaxVRunner:
             return {"balance_tot_asset": "", "balance_dnca": "", "balance_json": ""}
 
     def monitor_intraday(self) -> None:
-        now_kst = self._now_kst().strftime("%H:%M")
-        if not self._is_krx_trading_day():
-            self._maybe_heartbeat(
-                "holiday",
-                f"휴장일로 감시 스킵... now={now_kst} KST (감시대상={len(self.today_universe)})",
-            )
-            return
+        now_kst = self._now_kst_local().strftime("%H:%M")
         if now_kst < settings.monitor_start_hhmm or now_kst > settings.monitor_end_hhmm:
             if self.today_universe:
                 holdings_cnt = self._get_holdings_count_with_cache()
@@ -680,10 +481,6 @@ class MaxVRunner:
             ord_no = str(result.get("ord_no", "") or "")
             self._add_pending_order(symbol=symbol, side="BUY", qty=qty, ord_no=ord_no, before_qty=before_qty)
             self.bought_symbols.add(symbol)
-            positions = self._load_positions()
-            positions[symbol] = qty
-            today = today_kst_yyyymmdd(self._now_kst())
-            self._save_positions({"date_kst": today, "positions": positions})
             name = self.symbols.get_name(symbol, fetch=True)
             cash_psbl_after = self._get_cash_with_cache(force_refresh=True)
             bal = self._get_balance_summary_safely()
@@ -758,37 +555,6 @@ class MaxVRunner:
             self.logger.error(f"CASH failed: {exc}")
             return self.cached_cash
 
-    def _load_positions_payload(self) -> Dict[str, object]:
-        if not self.positions_file.exists():
-            return {"date_kst": "", "positions": {}}
-        try:
-            raw = json.loads(self.positions_file.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            self.logger.error(f"positions.json JSON 파싱 실패 ({self.positions_file}): {exc}")
-            return {"date_kst": "", "positions": {}}
-        if not isinstance(raw, dict):
-            return {"date_kst": "", "positions": {}}
-        if "positions" in raw:
-            pos = raw.get("positions")
-            if pos is None or not isinstance(pos, dict):
-                pos = {}
-            return {"date_kst": str(raw.get("date_kst", "") or ""), "positions": pos}
-        return {"date_kst": "", "positions": dict(raw)}
-
-    def _load_positions(self) -> Dict[str, int]:
-        payload = self._load_positions_payload()
-        positions = payload.get("positions", {})
-        if isinstance(positions, dict):
-            return {str(k): int(v) for k, v in positions.items()}
-        return {}
-
-    def _save_positions(self, positions_payload: Dict[str, object]) -> None:
-        self.positions_file.parent.mkdir(parents=True, exist_ok=True)
-        self.positions_file.write_text(
-            json.dumps(positions_payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
     def _get_holdings_with_cache(self, force_refresh: bool = False) -> List[Dict[str, object]]:
         now_ts = time.time()
         if not force_refresh and now_ts - self.holdings_updated_at < self.holdings_refresh_sec:
@@ -816,19 +582,6 @@ class MaxVRunner:
         except Exception:
             return 0
         return 0
-
-    def _prior_trading_session_kst_yyyymmdd(self, now_kst: datetime) -> str:
-        """Most recent KRX trading day strictly before now_kst's calendar date (KST)."""
-        d = now_kst.date() - timedelta(days=1)
-        for _ in range(40):
-            if self._is_krx_trading_day(d):
-                return d.strftime("%Y%m%d")
-            d -= timedelta(days=1)
-        fb = (now_kst.date() - timedelta(days=1)).strftime("%Y%m%d")
-        self.logger.warning(
-            f"prior_trading_session: no trading day in 40d lookback; fallback calendar-1={fb}"
-        )
-        return fb
 
     def _add_pending_order(self, *, symbol: str, side: str, qty: int, ord_no: str, before_qty: int) -> None:
         if not ord_no:

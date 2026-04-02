@@ -12,6 +12,8 @@ from typing import Dict, List, Tuple, TypedDict
 
 import requests
 from bs4 import BeautifulSoup
+from zoneinfo import ZoneInfo
+from datetime import datetime
 
 _log = logging.getLogger("maxv")
 
@@ -41,6 +43,25 @@ def passes_ma5_newest_first(closes: List[int]) -> bool:
     ref = closes[0]
     ma5 = sum(closes[0:5]) / 5
     return ref > ma5
+
+
+def _today_yyyymmdd_dot_kst() -> str:
+    return datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y.%m.%d")
+
+
+def _select_ref_index_latest_closed(bars: List[DailyBar], today_dot: str) -> int:
+    """
+    Naver day page can show today's (in-progress) bar as the first row during market hours.
+    For strategy/universe prep we want the latest *closed* session bar.
+
+    Returns:
+        index of the bar to treat as "latest closed" (0 or 1 typically).
+    """
+    if not bars:
+        return 0
+    if bars[0].get("date", "") == today_dot and len(bars) >= 2:
+        return 1
+    return 0
 
 
 def _parse_market_sum_page(html: str) -> List[Tuple[str, int]]:
@@ -144,11 +165,13 @@ def build_naver_universe(top_ratio: float, delay_sec: float) -> Tuple[List[str],
     candidates = ranked[:top_n]
     selected: List[str] = []
     daily_fail = 0
+    today_dot = _today_yyyymmdd_dot_kst()
     for symbol in candidates:
         try:
             bars = _fetch_daily_bars(session, symbol)
             time.sleep(delay_sec)
-            closes = [b["close"] for b in bars]
+            ref_i = _select_ref_index_latest_closed(bars, today_dot=today_dot)
+            closes = [b["close"] for b in bars[ref_i : ref_i + 5]]
             if len(closes) < 5:
                 daily_fail += 1
                 continue
@@ -197,20 +220,22 @@ def build_naver_universe_with_features(
     selected: List[str] = []
     features: Dict[str, Dict[str, int]] = {}
     daily_fail = 0
+    today_dot = _today_yyyymmdd_dot_kst()
     for symbol in candidates:
         try:
             bars = _fetch_daily_bars(session, symbol)
             time.sleep(delay_sec)
-            if len(bars) < 5:
+            ref_i = _select_ref_index_latest_closed(bars, today_dot=today_dot)
+            if len(bars) < (ref_i + 5):
                 daily_fail += 1
                 continue
-            closes = [b["close"] for b in bars]
+            closes = [b["close"] for b in bars[ref_i : ref_i + 5]]
             if not passes_ma5_newest_first(closes):
                 continue
 
-            vols = [b["volume"] for b in bars[:5]]
+            vols = [b["volume"] for b in bars[ref_i : ref_i + 5]]
             avg_vol_5d = int(sum(vols) / 5)
-            prev = bars[0]
+            prev = bars[ref_i]
             selected.append(symbol)
             features[symbol] = {
                 "avg_volume_5d": avg_vol_5d,
