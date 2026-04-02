@@ -18,6 +18,9 @@ from core.universe import UniverseBuilder
 from core.universe_cache import CachedSymbol, UniverseCache, cache_path, load_cache, save_cache, today_kst_yyyymmdd
 
 
+_REPO_ROOT = Path(__file__).resolve().parent
+
+
 @dataclass
 class PendingOrder:
     created_ts: float
@@ -39,7 +42,8 @@ class MaxVRunner:
         self.strategy = VolatilityBreakoutStrategy()
         self.symbols = SymbolResolver()
 
-        self.positions_file = Path("data") / "positions.json"
+        # cwd와 무관하게 항상 이 프로젝트의 data/positions.json만 사용 (실행 위치에 따라 파일이 갈라지는 문제 방지)
+        self.positions_file = _REPO_ROOT / "data" / "positions.json"
         self.today_universe: List[str] = []
         self.bought_symbols: set[str] = set()
         self.cached_cash: int = 0
@@ -70,6 +74,7 @@ class MaxVRunner:
     def run(self) -> None:
         self._configure_console_utf8()
         self.logger.info("MaxV started.")
+        self.logger.info(f"positions.json 절대경로: {self.positions_file.resolve()}")
 
         # Candidate list uses prior session OHLCV only; safe after the open.
         # Run once on startup on a weekday so a late start still gets today's watch list.
@@ -225,7 +230,7 @@ class MaxVRunner:
     def prepare_universe(self) -> None:
         self.logger.info("Preparing universe...")
 
-        cache_date = today_kst_yyyymmdd()
+        cache_date = today_kst_yyyymmdd(self._now_kst())
         ucache_path = cache_path(Path("data"), cache_date)
         cache = load_cache(ucache_path)
 
@@ -375,18 +380,26 @@ class MaxVRunner:
             )
             return
         today = today_kst_yyyymmdd(now_kst)
-        yesterday = self._yesterday_kst_yyyymmdd(now_kst)
+        prior_session = self._prior_trading_session_kst_yyyymmdd(now_kst)
         payload = self._load_positions_payload()
-        if payload.get("date_kst") != yesterday:
+        if payload.get("date_kst") != prior_session:
             self.logger.info(
                 f"Liquidation skipped: positions date_kst={payload.get('date_kst','')} "
-                f"(expected_yesterday={yesterday})"
+                f"(expected_prior_session={prior_session})"
             )
             return
         raw_positions = payload.get("positions", {}) if isinstance(payload.get("positions", {}), dict) else {}
         prev_syms = {str(sym) for sym, qty in raw_positions.items() if int(qty or 0) > 0}
         if not prev_syms:
-            self.logger.info("Liquidation skipped: no previous-day positions in positions.json")
+            acct_n = self._get_holdings_count_with_cache()
+            self.logger.warning(
+                "청산 스킵: positions.json에 전일(직전 영업일) 매수 종목이 비어 있음 — "
+                f"expected_prior_session={prior_session}, 계좌보유={acct_n}종목, "
+                f"file={self.positions_file.resolve()} "
+                "(실행 cwd가 바뀌면 예전에는 다른 경로의 JSON을 읽었을 수 있습니다)."
+            )
+            self._save_positions({"date_kst": today, "positions": {}})
+            self._sync_bought_symbols_from_positions()
             return
 
         holdings = self._get_holdings_with_cache(force_refresh=True)
@@ -450,7 +463,7 @@ class MaxVRunner:
         self.bought_symbols.clear()
 
     def _sync_bought_symbols_from_positions(self) -> None:
-        today = today_kst_yyyymmdd()
+        today = today_kst_yyyymmdd(self._now_kst())
         payload = self._load_positions_payload()
         if payload.get("date_kst") != today:
             self.bought_symbols = set()
@@ -466,12 +479,12 @@ class MaxVRunner:
         if now_hhmm < settings.liquidation_hhmm:
             return
 
-        today = today_kst_yyyymmdd()
+        today = today_kst_yyyymmdd(self._now_kst())
         payload = self._load_positions_payload()
         raw_positions = payload.get("positions", {}) if isinstance(payload.get("positions", {}), dict) else {}
         if payload.get("date_kst") == today:
             return
-        if payload.get("date_kst") != self._yesterday_kst_yyyymmdd(now):
+        if payload.get("date_kst") != self._prior_trading_session_kst_yyyymmdd(now):
             return
         prev_syms = {str(sym) for sym, qty in raw_positions.items() if int(qty or 0) > 0}
         if not prev_syms:
@@ -669,7 +682,7 @@ class MaxVRunner:
             self.bought_symbols.add(symbol)
             positions = self._load_positions()
             positions[symbol] = qty
-            today = today_kst_yyyymmdd()
+            today = today_kst_yyyymmdd(self._now_kst())
             self._save_positions({"date_kst": today, "positions": positions})
             name = self.symbols.get_name(symbol, fetch=True)
             cash_psbl_after = self._get_cash_with_cache(force_refresh=True)
@@ -748,12 +761,19 @@ class MaxVRunner:
     def _load_positions_payload(self) -> Dict[str, object]:
         if not self.positions_file.exists():
             return {"date_kst": "", "positions": {}}
-        raw = json.loads(self.positions_file.read_text(encoding="utf-8"))
-        if isinstance(raw, dict) and "positions" in raw:
-            return {"date_kst": str(raw.get("date_kst", "")), "positions": raw.get("positions", {})}
-        if isinstance(raw, dict):
-            return {"date_kst": "", "positions": raw}
-        return {"date_kst": "", "positions": {}}
+        try:
+            raw = json.loads(self.positions_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            self.logger.error(f"positions.json JSON 파싱 실패 ({self.positions_file}): {exc}")
+            return {"date_kst": "", "positions": {}}
+        if not isinstance(raw, dict):
+            return {"date_kst": "", "positions": {}}
+        if "positions" in raw:
+            pos = raw.get("positions")
+            if pos is None or not isinstance(pos, dict):
+                pos = {}
+            return {"date_kst": str(raw.get("date_kst", "") or ""), "positions": pos}
+        return {"date_kst": "", "positions": dict(raw)}
 
     def _load_positions(self) -> Dict[str, int]:
         payload = self._load_positions_payload()
@@ -797,9 +817,18 @@ class MaxVRunner:
             return 0
         return 0
 
-    @staticmethod
-    def _yesterday_kst_yyyymmdd(now_kst: datetime) -> str:
-        return (now_kst.date() - timedelta(days=1)).strftime("%Y%m%d")
+    def _prior_trading_session_kst_yyyymmdd(self, now_kst: datetime) -> str:
+        """Most recent KRX trading day strictly before now_kst's calendar date (KST)."""
+        d = now_kst.date() - timedelta(days=1)
+        for _ in range(40):
+            if self._is_krx_trading_day(d):
+                return d.strftime("%Y%m%d")
+            d -= timedelta(days=1)
+        fb = (now_kst.date() - timedelta(days=1)).strftime("%Y%m%d")
+        self.logger.warning(
+            f"prior_trading_session: no trading day in 40d lookback; fallback calendar-1={fb}"
+        )
+        return fb
 
     def _add_pending_order(self, *, symbol: str, side: str, qty: int, ord_no: str, before_qty: int) -> None:
         if not ord_no:
