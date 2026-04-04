@@ -36,7 +36,6 @@ class TradeLogger:
         self._trade_fields = [
             "ts",
             "symbol",
-            "symbol_name",
             "side",
             "qty",
             "price",
@@ -56,7 +55,6 @@ class TradeLogger:
         self._signal_fields = [
             "ts",
             "symbol",
-            "symbol_name",
             "breakout_price",
             "reason",
             "action",
@@ -97,7 +95,9 @@ class TradeLogger:
             "w", newline="", encoding="utf-8"
         ) as dst:
             reader = csv.DictReader(src)
-            writer = csv.DictWriter(dst, fieldnames=fieldnames)
+            writer = csv.DictWriter(
+                dst, fieldnames=fieldnames, extrasaction="ignore"
+            )
             writer.writeheader()
             for row in reader:
                 writer.writerow(row)

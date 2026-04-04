@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import json
 import time
-from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List
 from zoneinfo import ZoneInfo
@@ -11,23 +11,11 @@ from config.settings import settings
 from core.api_client import KISApiClient
 from core.logger import TradeLogger
 from core.order import OrderManager
-from core.symbol_resolver import SymbolResolver
 from core.strategy import VolatilityBreakoutStrategy
 from core.universe_cache import CachedSymbol, UniverseCache, cache_path, load_cache, save_cache, today_kst_yyyymmdd
 
 
 _REPO_ROOT = Path(__file__).resolve().parent
-
-
-@dataclass
-class PendingOrder:
-    created_ts: float
-    symbol: str
-    side: str  # BUY|SELL
-    qty: int
-    ord_no: str
-    before_qty: int
-    deadline_ts: float
 
 
 class MaxVRunner:
@@ -37,7 +25,6 @@ class MaxVRunner:
         self.logger = TradeLogger(log_dir=settings.log_dir)
         self.order = OrderManager(api=self.api, settings=settings)
         self.strategy = VolatilityBreakoutStrategy()
-        self.symbols = SymbolResolver()
 
         self.today_universe: List[str] = []
         # Running set of symbols we should never buy again during this process.
@@ -62,7 +49,7 @@ class MaxVRunner:
         self._did_prepare_ymd: str = ""
         self._did_liquidate_ymd: str = ""
         self._last_monitor_ts: float = 0.0
-        self._pending_orders: List[PendingOrder] = []
+        self._did_result_csv_ymd: str = ""
 
     def run(self) -> None:
         self._configure_console_utf8()
@@ -102,14 +89,15 @@ class MaxVRunner:
         ymd = now.strftime("%Y%m%d")
         hhmm = now.strftime("%H:%M")
 
-        self._reconcile_pending_orders()
-
         # Pre-open liquidation: sell all holdings once at 08:50.
         if hhmm >= settings.liquidation_hhmm and self._did_liquidate_ymd != ymd:
             self.liquidate_all_holdings_at_open()
             self._did_liquidate_ymd = ymd
 
         if hhmm >= settings.shutdown_hhmm:
+            if self._did_result_csv_ymd != ymd:
+                self._write_daily_result_csv(ymd)
+                self._did_result_csv_ymd = ymd
             self.request_shutdown()
             return
 
@@ -307,7 +295,7 @@ class MaxVRunner:
             qty = int(row.get("qty", 0) or 0)
             if not symbol or qty <= 0:
                 continue
-            to_sell.append({"symbol": symbol, "qty": qty, "name": row.get("name", "")})
+            to_sell.append({"symbol": symbol, "qty": qty})
 
         if not to_sell:
             self.logger.info(f"08:50 청산: 보유 종목 없음 (now={now_hhmm} KST)")
@@ -319,23 +307,17 @@ class MaxVRunner:
         for row in to_sell:
             symbol = str(row["symbol"])
             qty = int(row["qty"])
-            name = self.symbols.get_name(symbol, fetch=True) or str(row.get("name", "") or "").strip()
-            before_qty = self._get_holding_qty(symbol)
             try:
                 result = self.order.place_open_liquidation(symbol=symbol, qty=qty)
             except Exception as exc:  # noqa: BLE001
                 self.logger.error(f"SELL submit failed {symbol}: {exc}")
                 continue
             ord_no = str(result.get("ord_no", "") or "")
-            self._add_pending_order(
-                symbol=symbol, side="SELL", qty=qty, ord_no=ord_no, before_qty=before_qty
-            )
             cash_psbl = self._get_cash_with_cache(force_refresh=True)
             bal = self._get_balance_summary_safely()
             self.logger.log_trade(
                 {
                     "symbol": symbol,
-                    "symbol_name": name,
                     "side": "SELL",
                     "qty": qty,
                     "price": 0,
@@ -348,10 +330,22 @@ class MaxVRunner:
                 }
             )
             self.logger.info(
-                f"[매도요청] {name or ''}({symbol}) qty={qty} 시장가(08:50 보유전량청산) "
+                f"[매도요청] {symbol} qty={qty} 시장가(08:50 보유전량청산) "
                 f"ord_no={ord_no} cash_psbl={cash_psbl}"
             )
             time.sleep(0.55)
+
+        try:
+            time.sleep(0.35)
+            rows_h = self._get_holdings_with_cache(force_refresh=True)
+            syms = {str(r.get("symbol", "")).strip() for r in rows_h if isinstance(r, dict)}
+            self.bought_symbols = {s for s in syms if s}
+            self.logger.info(
+                f"08:50 청산 후 재매수 방지 목록 재동기화: {len(self.bought_symbols)}종목 "
+                "(잔고=0이면 장중 신규 매수 가능)"
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error(f"08:50 청산 후 잔고 동기화 실패: {exc}")
 
     def _get_balance_summary_safely(self) -> Dict[str, object]:
         try:
@@ -415,7 +409,6 @@ class MaxVRunner:
                     self.logger.log_signal(
                         {
                             "symbol": symbol,
-                            "symbol_name": self.symbols.get_name(symbol, fetch=False),
                             "breakout_price": state.breakout_price or 0,
                             "reason": state.skip_reason,
                             "action": "SKIP_INITIAL_AB",
@@ -425,12 +418,10 @@ class MaxVRunner:
                     state.skip_reason = ""
                 continue
             cycle_signals += 1
-            symbol_name_cached = self.symbols.get_name(symbol, fetch=False)
             if not can_buy:
                 self.logger.log_signal(
                     {
                         "symbol": symbol,
-                        "symbol_name": symbol_name_cached,
                         "breakout_price": signal.breakout_price,
                         "reason": signal.reason,
                         "action": "SKIP_FULL_CAP",
@@ -445,7 +436,6 @@ class MaxVRunner:
                 self.logger.log_signal(
                     {
                         "symbol": symbol,
-                        "symbol_name": symbol_name_cached,
                         "breakout_price": signal.breakout_price,
                         "reason": signal.reason,
                         "action": "SKIP_HIGH_PRICE",
@@ -458,7 +448,6 @@ class MaxVRunner:
             self.logger.log_signal(
                 {
                     "symbol": symbol,
-                    "symbol_name": symbol_name_cached,
                     "breakout_price": signal.breakout_price,
                     "reason": signal.reason,
                     "action": "BUY_ATTEMPT",
@@ -477,17 +466,13 @@ class MaxVRunner:
                 continue
 
             qty = self.order.calc_buy_qty(cash=cash, breakout_price=signal.breakout_price)
-            before_qty = self._get_holding_qty(symbol)
             ord_no = str(result.get("ord_no", "") or "")
-            self._add_pending_order(symbol=symbol, side="BUY", qty=qty, ord_no=ord_no, before_qty=before_qty)
             self.bought_symbols.add(symbol)
-            name = self.symbols.get_name(symbol, fetch=True)
             cash_psbl_after = self._get_cash_with_cache(force_refresh=True)
             bal = self._get_balance_summary_safely()
             self.logger.log_trade(
                 {
                     "symbol": symbol,
-                    "symbol_name": name,
                     "side": "BUY",
                     "qty": qty,
                     "price": signal.breakout_price,
@@ -500,7 +485,7 @@ class MaxVRunner:
                 }
             )
             self.logger.info(
-                f"[매수] {name or ''}({symbol}) price={signal.breakout_price} qty={qty} "
+                f"[매수] {symbol} price={signal.breakout_price} qty={qty} "
                 f"ord_no={ord_no} cash_psbl={cash_psbl_after}"
             )
             cash = self._get_cash_with_cache(force_refresh=True)
@@ -516,13 +501,20 @@ class MaxVRunner:
         self._hb_buys += cycle_buys
         self._hb_skipped_signals += cycle_skipped_signals
 
+        hb_cap = ""
+        if len(self.bought_symbols) >= settings.max_positions:
+            hb_cap = (
+                f" (재매수 방지 {len(self.bought_symbols)}종목 ≥ {settings.max_positions}, "
+                "당일 신규 매수 한도 도달·감시만)"
+            )
         emitted = self._maybe_heartbeat(
             "monitoring",
             "계속 감시중... "
             f"now={now_kst} KST "
             f"watchlist={len(self.today_universe)} "
             f"holdings={self._get_holdings_count_with_cache()}/{settings.max_positions} "
-            f"{'(5종목 매수 완료, 주문 스킵 없이 감시만 계속)' if len(self.bought_symbols) >= settings.max_positions else ''} "
+            f"block={len(self.bought_symbols)}/{settings.max_positions}"
+            f"{hb_cap} "
             f"cash_cached={'Y' if (time.time() - self.cash_updated_at) < self.cash_refresh_sec else 'N'} "
             f"(cycles={self._hb_cycles}, scanned={self._hb_scanned}, quote_ok={self._hb_quote_ok}, "
             f"quote_err={self._hb_quote_err}, signals={self._hb_signals}, buys={self._hb_buys}, "
@@ -537,6 +529,39 @@ class MaxVRunner:
     def request_shutdown(self) -> None:
         self._should_stop = True
         self.logger.info(f"Auto shutdown at {settings.shutdown_hhmm} (KST).")
+
+    def _write_daily_result_csv(self, ymd: str) -> None:
+        if not settings.result_csv_on_shutdown:
+            return
+        try:
+            # 잔고 API는 쓰지 않음. KIS 일별체결(매매내역)만 사용.
+            from core.naver_symbol_master import load_or_refresh_symbol_master
+            from core.result_csv import (
+                append_result_rows,
+                build_daily_rows_from_kis_range,
+                kis_rows_to_execs,
+                kis_rows_to_symbol_names,
+            )
+
+            lookback = max(1, min(90, int(settings.result_csv_kis_lookback_days)))
+            end_dt = datetime.strptime(ymd, "%Y%m%d").replace(tzinfo=ZoneInfo("Asia/Seoul"))
+            start_ymd = (end_dt - timedelta(days=lookback)).strftime("%Y%m%d")
+            kis_rows = self.api.get_daily_order_executions(start_ymd, ymd)
+            execs = kis_rows_to_execs(kis_rows)
+            daily_rows = build_daily_rows_from_kis_range(execs, ymd)
+            names = load_or_refresh_symbol_master(
+                settings.symbol_master_path,
+                auto_refresh=settings.symbol_master_auto_refresh,
+                max_age_days=settings.symbol_master_max_age_days,
+                delay_sec=settings.naver_http_delay_sec,
+            )
+            kis_names = kis_rows_to_symbol_names(kis_rows)
+            append_result_rows(
+                settings.result_csv_path, daily_rows, names, kis_symbol_names=kis_names
+            )
+            self.logger.info(f"result.csv 갱신: {ymd} ({len(daily_rows)}건, KIS조회 {start_ymd}~{ymd})")
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error(f"result.csv 실패: {exc}")
 
     def _get_cash_with_cache(self, force_refresh: bool = False) -> int:
         now_ts = time.time()
@@ -572,64 +597,6 @@ class MaxVRunner:
     def _get_holdings_count_with_cache(self) -> int:
         _ = self._get_holdings_with_cache()
         return int(self.cached_holdings_count or 0)
-
-    def _get_holding_qty(self, symbol: str) -> int:
-        try:
-            rows = self._get_holdings_with_cache(force_refresh=True)
-            for r in rows:
-                if str(r.get("symbol", "")).strip() == str(symbol).strip():
-                    return int(r.get("qty", 0) or 0)
-        except Exception:
-            return 0
-        return 0
-
-    def _add_pending_order(self, *, symbol: str, side: str, qty: int, ord_no: str, before_qty: int) -> None:
-        if not ord_no:
-            self.logger.error(f"Order ACK missing ord_no: {side} {symbol} qty={qty}")
-            return
-        now_ts = time.time()
-        self._pending_orders.append(
-            PendingOrder(
-                created_ts=now_ts,
-                symbol=symbol,
-                side=side,
-                qty=int(qty or 0),
-                ord_no=ord_no,
-                before_qty=int(before_qty or 0),
-                deadline_ts=now_ts + 30.0,
-            )
-        )
-
-    def _reconcile_pending_orders(self) -> None:
-        if not self._pending_orders:
-            return
-        now_ts = time.time()
-        remaining: List[PendingOrder] = []
-        for po in self._pending_orders:
-            current_qty = self._get_holding_qty(po.symbol)
-            confirmed = False
-            if po.side == "BUY":
-                confirmed = current_qty >= (po.before_qty + po.qty)
-            elif po.side == "SELL":
-                confirmed = current_qty <= max(0, po.before_qty - po.qty)
-
-            if confirmed:
-                self.logger.info(
-                    f"[주문확인] {po.side} {po.symbol} ord_no={po.ord_no} "
-                    f"before_qty={po.before_qty} now_qty={current_qty}"
-                )
-                continue
-
-            if now_ts >= po.deadline_ts:
-                self.logger.error(
-                    f"[주문미확정] {po.side} {po.symbol} ord_no={po.ord_no} "
-                    f"before_qty={po.before_qty} now_qty={current_qty} "
-                    "잔고 반영으로 체결/미체결을 확정하지 못했습니다. KIS 주문/체결조회로 확인이 필요합니다."
-                )
-                continue
-
-            remaining.append(po)
-        self._pending_orders = remaining
 
 
 if __name__ == "__main__":

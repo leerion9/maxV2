@@ -54,6 +54,16 @@ class Settings:
     tax_rate_sell: float = 0.0018
 
     log_dir: Path = ROOT_DIR / "data" / "logs"
+    symbol_master_path: Path = ROOT_DIR / "data" / "kr_symbol_master.json"
+    # result.csv·봇 종료 시 마스터가 없거나 오래됐으면 네이버에서 갱신 (주 1회 등)
+    symbol_master_auto_refresh: bool = (
+        os.getenv("SYMBOL_MASTER_AUTO_REFRESH", "true").lower() == "true"
+    )
+    symbol_master_max_age_days: int = int(os.getenv("SYMBOL_MASTER_MAX_AGE_DAYS", "7") or "7")
+    result_csv_path: Path = ROOT_DIR / "data" / "logs" / "result.csv"
+    result_csv_on_shutdown: bool = os.getenv("RESULT_CSV_ON_SHUTDOWN", "true").lower() == "true"
+    # KIS 일별체결 FIFO(전일 매수·당일 매도 짝)용 조회 시작일: 종료일 기준 N일 전 (3개월 이내 API 한도)
+    result_csv_kis_lookback_days: int = int(os.getenv("RESULT_CSV_KIS_LOOKBACK_DAYS", "30") or "30")
 
     naver_http_delay_sec: float = float(os.getenv("NAVER_HTTP_DELAY_SEC", "0.05") or "0.05")
 
@@ -93,6 +103,8 @@ class Settings:
             raise ValueError("HEARTBEAT_SEC는 5 이상이어야 합니다. 예: 60")
         if self.watchlist_sample_size < 0:
             raise ValueError("WATCHLIST_SAMPLE_SIZE는 0 이상이어야 합니다. 예: 10")
+        if self.result_csv_kis_lookback_days < 1 or self.result_csv_kis_lookback_days > 90:
+            raise ValueError("RESULT_CSV_KIS_LOOKBACK_DAYS는 1~90(3개월 이내)이어야 합니다.")
 
 
 settings = Settings()

@@ -41,13 +41,23 @@
 - 로그 신뢰성 강화: `core/logger.py`에서 파일/콘솔 핸들러를 명시적으로 구성하고 flush를 강제하여 `data/logs/system.log|trades.csv|signals.csv` 누락 가능성을 낮춤.
 - 표준시간 기반: KIS 응답 헤더 `Date`를 이용해 서버-로컬 오프셋을 추정하고, `main.py`에서 주요 스케줄(유니버스 준비/청산/종료)을 해당 기준 시각(KST)으로 판단하도록 변경.
 - 청산 시각 변경: 익일 시가 청산을 **08:55(KST) 시장가 주문**으로 변경. 단, 장중 기동 시 전일 보유분만 즉시 청산하는 기존 로직은 유지해야 함.
-- 주문 처리 확인(1차): 주문 전송 후 `ord_no`(ACK)를 저장하고, 일정 시간(기본 30초) 동안 잔고 반영으로 BUY/SELL 결과를 재확인하여 `[주문확인]` 또는 `[주문미확정]` 로그를 남김. (추후 KIS 주문/체결조회 API로 확정 단계 강화 예정)
+- 주문 체결은 잔고/KIS 체결조회로 자동 확정하지 않음. 주문 ACK(`ord_no`)와 로그·CSV로만 기록.
 
-다음 호출 시 우선 작업:
-- 월요일 재테스트 로그 점검:
-  - `system.log`에서 KIS 거래일 판정/휴장일 스킵 로그 확인
-  - 보유 한도 도달 후 `signals.csv`에 `SKIP_FULL_CAP` 누적 확인
-  - `SHUTDOWN_HHMM=15:40` 자동 종료 확인
-- KIS 시총 랭킹 API: 모의/실전·파라미터·페이징 여부 조사. 필요 시 네이버 기반 유니버스를 폴백/대체 소스로 연결할지 결정.
-- 장중 API 오류(CASH/QUOTE) 재현 빈도 확인 후 재시도/백오프 정책 추가 보강 검토.
-- 테스트: 프로젝트 루트에서 `python -m pytest -q` (단독 `pytest`는 `core` import 오류 날 수 있음).
+최근 작업(2026-04-04):
+- `result.csv`(KIS 일별 주문·체결만 사용, 잔고 API 미사용): FIFO로 매도 체결일 기준 청산 라운드 한 줄, 당일 매수·미청산은 OPEN 행.
+- `core/result_csv.py`, `scripts/build_result.py`: `python -m scripts.build_result [--date YYYYMMDD]`
+- 종목명: `data/kr_symbol_master.json`(네이버 시총 페이지) + KIS 응답 `prdt_name` 폴백; `SYMBOL_MASTER_AUTO_REFRESH`(기본 true), `SYMBOL_MASTER_MAX_AGE_DAYS`(기본 7)
+- 종목코드 6자리 zfill, 필드 키 대소문자 무시 `_gv`, 빈 CSV 행은 누적/번호 계산 시 무시
+- `main.py`: `SHUTDOWN_HHMM` 도달 시 당일 `ymd`로 `result.csv` append( `RESULT_CSV_ON_SHUTDOWN` 기본 true)
+- `core/api_client.py`: 일별체결 조회 `get_daily_order_executions` 등
+- `scripts/update_symbol_master.py`: 마스터 수동 갱신
+- 테스트: `tests/test_result_fifo.py`
+
+다음 호출 시 우선 작업(월요일 등 재가동 시):
+- **result.csv 자동 기록**: 장 종료 후 `SHUTDOWN_HHMM`까지 봇이 정상 루프를 탄 뒤 종료되는지 확인; `system.log`에 `result.csv 갱신: YYYYMMDD (N건, …)` 여부 확인
+- **수동 보정**: 조기 종료 시 `python -m scripts.build_result --date YYYYMMDD`로 당일 분 보완
+- **중복 방지**: 같은 영업일에 `build_result`를 여러 번 돌리지 않기(append만 함)
+- `system.log`: KIS 거래일/휴장일, 기타 기존 점검 항목
+- `signals.csv`: `SKIP_FULL_CAP` 등
+- KIS 시총 랭킹 API(모의 한도)·장중 API 오류 재시도 등 기존 백로그
+- 테스트: `python -m pytest -q`

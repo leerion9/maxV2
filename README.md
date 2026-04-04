@@ -23,7 +23,12 @@ maxv/
 │   ├── order.py
 │   ├── strategy.py
 │   ├── naver_universe.py
+│   ├── naver_symbol_master.py
+│   ├── result_csv.py
 │   └── universe_cache.py
+├── scripts/
+│   ├── build_result.py
+│   └── update_symbol_master.py
 ├── data/
 │   └── logs/
 ├── tests/
@@ -42,6 +47,8 @@ maxv/
 - `core/strategy.py`: A->B 상태머신
 - `core/order.py`: 호가 반올림, 수량 계산, 주문 실행
 - `core/logger.py`: 로그/CSV 기록
+- `core/result_csv.py`: KIS 일별체결 기반 `result.csv` 집계(FIFO)
+- `core/naver_symbol_master.py`: 네이버 시총 페이지에서 종목코드·종목명 마스터
 - `main.py`: 실행 엔트리(기동 시간 3분기 로직)
 
 ## 실행 로직(기동 시간 기준)
@@ -70,6 +77,10 @@ IS_PAPER_TRADING=true
 NAVER_HTTP_DELAY_SEC=0.05
 HEARTBEAT_SEC=600
 SHUTDOWN_HHMM=15:40
+RESULT_CSV_ON_SHUTDOWN=true
+RESULT_CSV_KIS_LOOKBACK_DAYS=30
+SYMBOL_MASTER_AUTO_REFRESH=true
+SYMBOL_MASTER_MAX_AGE_DAYS=7
 ```
 
 - `ACCOUNT_NO`는 `8자리-2자리` 형식을 권장합니다.
@@ -93,10 +104,18 @@ python -m pytest -q
 
 (`pytest -q`만 실행하면 `ModuleNotFoundError: core`가 날 수 있습니다.)
 
+## result.csv (매매 정리)
+- **수동**: `python -m scripts.build_result` (당일 KST) 또는 `python -m scripts.build_result --date YYYYMMDD`
+- **자동**: `SHUTDOWN_HHMM`(기본 15:40, KST)에 루프가 도달하면 **그날짜** 기준으로 KIS 일별체결을 조회해 `data/logs/result.csv`에 **append**합니다. (`RESULT_CSV_ON_SHUTDOWN=false`로 끌 수 있음)
+- 한 줄은 **청산 완료 시** 과거 매수(FIFO) + 당일(지정일) 매도를 합친 형태입니다. 당일 매수만 있고 매도가 없으면 **OPEN** 행(매도 칸 비움)으로 나갈 수 있습니다.
+- 종목명: `data/kr_symbol_master.json`을 사용하고, 없거나 오래되면 네이버에서 갱신(`SYMBOL_MASTER_AUTO_REFRESH`, `SYMBOL_MASTER_MAX_AGE_DAYS`). 수동 갱신: `python -m scripts.update_symbol_master`
+- 조회 구간: `RESULT_CSV_KIS_LOOKBACK_DAYS`(기본 30, 최대 90). **같은 영업일에 스크립트를 여러 번 실행하면 중복 행**이 생길 수 있습니다.
+
 ## 로그 확인
-- `data/logs/system.log`: 스케줄, 유니버스 필터 건수
+- `data/logs/system.log`: 스케줄, 유니버스 필터 건수, `result.csv 갱신` 로그
 - `data/logs/trades.csv`: 체결 기록
 - `data/logs/signals.csv`: 장중 시그널 기록(보유한도 도달로 주문 스킵된 케이스 포함)
+- `data/logs/result.csv`: 일별 청산·OPEN 요약(로컬·`.gitignore`)
 
 ## 중요 메모
 - KIS 요청 제한을 피하기 위해 예수금 조회는 캐시를 사용합니다.
@@ -104,4 +123,4 @@ python -m pytest -q
 - 장중 실행 시 네이버 일봉 첫 행이 당일(진행중 봉)일 수 있어, 최신 *완료된* 거래일 봉으로 보정하여 계산합니다.
 
 ## 형상관리
-- 사용자가 로컬 전용으로 둘 수 있으므로, git 커밋/푸시는 요청이 있을 때만 진행하면 됩니다.
+- `data/`는 기본적으로 git에 포함하지 않습니다(로그·캐시·`result.csv` 등).

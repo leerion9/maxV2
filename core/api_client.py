@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -10,6 +11,8 @@ import requests
 from zoneinfo import ZoneInfo
 
 from config.settings import Settings
+
+_log = logging.getLogger("maxv")
 
 
 def _kis_json_payload_rate_limited(data: object) -> bool:
@@ -286,7 +289,31 @@ class KISApiClient:
             if qty <= 0:
                 continue
             name = str(r.get("prdt_name", "") or r.get("PRDT_NAME", "") or "").strip()
-            positions.append({"symbol": symbol, "qty": qty, "name": name})
+
+            def _pv(*keys: str) -> float:
+                for k in keys:
+                    if k not in r or r[k] in (None, ""):
+                        continue
+                    try:
+                        return float(str(r[k]).replace(",", "").strip())
+                    except Exception:
+                        continue
+                return 0.0
+
+            pchs_avg = _pv("pchs_avg_prvs", "PCHS_AVG_PRVS", "avg_prvs")
+            pchs_amt = _pv("pchs_amt", "PCHS_AMT")
+            if pchs_amt <= 0 and qty > 0 and pchs_avg > 0:
+                pchs_amt = float(qty) * pchs_avg
+
+            positions.append(
+                {
+                    "symbol": symbol,
+                    "qty": qty,
+                    "name": name,
+                    "pchs_avg_prvs": pchs_avg,
+                    "pchs_amt": pchs_amt,
+                }
+            )
         return positions
 
     def get_quote(self, symbol: str) -> Quote:
@@ -580,6 +607,107 @@ class KISApiClient:
                 else:
                     time.sleep(0.7)
         raise RuntimeError(f"order failed after retry: {last_error}") from last_error
+
+    def _fetch_inquire_daily_ccld(self, start_yyyymmdd: str, end_yyyymmdd: str, tr_id: str) -> List[Dict[str, object]]:
+        url = f"{self.settings.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+        all_rows: List[Dict[str, object]] = []
+        fk, nk = "", ""
+        page_count = 0
+        while True:
+            page_count += 1
+            if page_count > 500:
+                raise RuntimeError("KIS daily ccld: pagination limit exceeded")
+            params = {
+                "CANO": self.settings.cano,
+                "ACNT_PRDT_CD": self.settings.acnt_prdt_cd,
+                "INQR_STRT_DT": start_yyyymmdd,
+                "INQR_END_DT": end_yyyymmdd,
+                "SLL_BUY_DVSN_CD": "00",
+                "PDNO": "",
+                "CCLD_DVSN": "01",
+                "INQR_DVSN": "01",
+                "INQR_DVSN_3": "00",
+                "ORD_GNO_BRNO": "",
+                "ODNO": "",
+                "INQR_DVSN_1": "",
+                "CTX_AREA_FK100": fk,
+                "CTX_AREA_NK100": nk,
+            }
+            data: Optional[dict] = None
+            resp: Optional[requests.Response] = None
+            last_err: Optional[Exception] = None
+            for _ in range(self._kis_retry_max()):
+                try:
+                    self.ensure_token()
+                    self._pace_api()
+                    resp = self.session.get(
+                        url,
+                        headers=self._headers(tr_id),
+                        params=params,
+                        timeout=self.settings.request_timeout_sec,
+                    )
+                    self._update_server_time_offset_from_response(resp)
+                    if resp.status_code >= 400 and _response_is_rate_limited(resp):
+                        time.sleep(self._kis_rate_sleep())
+                        last_err = RuntimeError("rate limited")
+                        continue
+                    if resp.status_code >= 400:
+                        detail = _http_error_detail(resp)
+                        raise RuntimeError(f"KIS daily ccld HTTP error: {detail}")
+                    data = resp.json()
+                    if _kis_json_payload_rate_limited(data):
+                        time.sleep(self._kis_rate_sleep())
+                        last_err = RuntimeError("rate limited json")
+                        continue
+                    break
+                except RuntimeError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    last_err = exc
+                    time.sleep(0.35)
+            if data is None or resp is None:
+                raise RuntimeError(f"KIS daily ccld failed: {last_err}") from last_err
+
+            rt = str(data.get("rt_cd", "0") or "0")
+            if rt not in ("", "0"):
+                msg = str(data.get("msg1", ""))
+                raise RuntimeError(f"KIS daily ccld biz error(rt_cd={rt}): {msg}")
+            rows = data.get("output1", [])
+            if isinstance(rows, dict):
+                rows = [rows]
+            elif not isinstance(rows, list):
+                rows = []
+            all_rows.extend(rows)
+            fk = str(data.get("ctx_area_fk100") or data.get("CTX_AREA_FK100") or "").strip()
+            nk = str(data.get("ctx_area_nk100") or data.get("CTX_AREA_NK100") or "").strip()
+            tr_cont = _response_header_ci(resp, "tr_cont").upper()
+            if tr_cont in ("M", "F") and (fk or nk):
+                time.sleep(0.25)
+                continue
+            break
+        return all_rows
+
+    def get_daily_order_executions(self, start_yyyymmdd: str, end_yyyymmdd: str) -> List[Dict[str, object]]:
+        """
+        KIS: 주식일별주문체결조회 — 우선 TTTC0081R(3개월 이내), 0건이면 TTTC8001R로 재조회.
+
+        체결만(CCLD_DVSN=01), 정순(INQR_DVSN=01). EXCG_ID는 보내지 않음(거래소 필터 회피).
+        """
+        tid = "VTTC0081R" if self.settings.is_paper_trading else "TTTC0081R"
+        rows = self._fetch_inquire_daily_ccld(start_yyyymmdd, end_yyyymmdd, tid)
+        if not rows:
+            _log.warning("KIS 일별체결 TR=%s 0건; TR=8001R로 재조회", tid)
+            tid2 = "VTTC8001R" if self.settings.is_paper_trading else "TTTC8001R"
+            rows = self._fetch_inquire_daily_ccld(start_yyyymmdd, end_yyyymmdd, tid2)
+        return rows
+
+
+def _response_header_ci(resp: requests.Response, name: str) -> str:
+    want = name.lower()
+    for k, v in resp.headers.items():
+        if k.lower() == want:
+            return (v or "").strip()
+    return ""
 
 
 def _http_error_detail(resp: requests.Response) -> str:
