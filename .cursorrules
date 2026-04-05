@@ -29,7 +29,7 @@
 
 최근 완료한 작업:
 - 유니버스 MA5 필터: KIS 일봉이 최신순(`rows[0]`=직전 개장일 봉)일 때 `전일 종가 > MA5`와 맞도록 수정. `main.py`의 돌파가 계산과 인덱스 일치.
-- `main.py`: 기동 시간을 3분기(개장 전/장중/장후)로 단순화하고, 08:50 보유 전량 시장가 청산 로직으로 변경. 휴장일 체크/전일 포지션 판정/장중 자동매도 로직 삭제.
+- `main.py`: 기동 시간을 3분기(개장 전/장중/장후)로 단순화하고, 08:50 보유 전량 시장가 청산 로직으로 변경. 전일 포지션 판정/장중 자동매도 로직 삭제. 평일 공휴일·선거일은 `config/korea_market_holidays.txt` 수동 목록 + 주말로 기동 시 즉시 종료(`core/trading_day.py`).
 - `core/naver_universe.py`: 장중 실행 시 네이버 일봉 첫 행이 당일(진행중 봉)일 수 있어, 최신 *완료된* 거래일 봉으로 보정하여 MA5/전일고저/5일 평균 거래량을 계산하도록 개선.
 - 알려진 이슈: 모의투자 KIS `get_market_cap_rankings()`가 약 60건 수준만 반환하는 경우가 있어 `top_ratio=0.1`이면 후보가 ~6종목으로 제한됨. 전 시장 10%와 불일치할 수 있음.
 - 콘솔/로그 개선: `main.py` 감시 루프에 주기적 하트비트(“대상 감시중…”) 및 감시 준비/대기 메시지 추가. 기본 하트비트 10분(`HEARTBEAT_SEC=600`).
@@ -53,11 +53,15 @@
 - `scripts/update_symbol_master.py`: 마스터 수동 갱신
 - 테스트: `tests/test_result_fifo.py`
 
+최근 작업(2026-04-05):
+- 휴장일: `config/korea_market_holidays.txt` 수동 목록 + 주말. `core/trading_day.py`, `HOLIDAY_DATES_PATH`. KIS `get_holiday_info` 파싱 보강(`output1`, `OPND_YN` 등)은 API 호환용으로 유지.
+- 테스트: `tests/test_trading_day.py`
+
 다음 호출 시 우선 작업(월요일 등 재가동 시):
 - **result.csv 자동 기록**: 장 종료 후 `SHUTDOWN_HHMM`까지 봇이 정상 루프를 탄 뒤 종료되는지 확인; `system.log`에 `result.csv 갱신: YYYYMMDD (N건, …)` 여부 확인
 - **수동 보정**: 조기 종료 시 `python -m scripts.build_result --date YYYYMMDD`로 당일 분 보완
 - **중복 방지**: 같은 영업일에 `build_result`를 여러 번 돌리지 않기(append만 함)
-- `system.log`: KIS 거래일/휴장일, 기타 기존 점검 항목
+- `system.log`: 휴장일 스킵 메시지, `result.csv` 갱신, 기타 기존 점검 항목
 - `signals.csv`: `SKIP_FULL_CAP` 등
 - KIS 시총 랭킹 API(모의 한도)·장중 API 오류 재시도 등 기존 백로그
 - 테스트: `python -m pytest -q`

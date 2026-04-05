@@ -506,6 +506,14 @@ class KISApiClient:
             f"market-cap ranking request failed for market={fid_input_iscd}: {last_error}"
         )
 
+    @staticmethod
+    def _kis_row_opnd_yn(row: Dict[str, object]) -> str:
+        """KIS 응답 키 대소문자·별칭 차이를 흡수합니다."""
+        for k, v in row.items():
+            if str(k).strip().upper() == "OPND_YN":
+                return str(v or "").strip().upper()
+        return ""
+
     def get_holiday_info(self, base_date_yyyymmdd: str) -> List[Dict[str, str]]:
         """
         KIS: 국내휴장일조회.
@@ -523,12 +531,28 @@ class KISApiClient:
             params=params,
             error_prefix="KIS holiday request failed",
         )
-        output = data.get("output", [])
-        if isinstance(output, dict):
-            return [output]
-        if isinstance(output, list):
-            return output
-        return []
+        rt = str(data.get("rt_cd", "0") or "0")
+        if rt not in ("", "0"):
+            _log.warning(
+                "KIS holiday rt_cd=%s msg=%s (BASS_DT=%s)",
+                rt,
+                data.get("msg1", ""),
+                base_date_yyyymmdd,
+            )
+            return []
+
+        rows: List[Dict[str, str]] = []
+        for key in ("output", "output1", "output2"):
+            block = data.get(key)
+            if block is None or block == "":
+                continue
+            if isinstance(block, dict):
+                rows.append(block)  # type: ignore[arg-type]
+            elif isinstance(block, list):
+                for item in block:
+                    if isinstance(item, dict):
+                        rows.append(item)  # type: ignore[arg-type]
+        return rows
 
     def is_open_trading_day(self, base_date_yyyymmdd: str) -> Optional[bool]:
         """
@@ -540,7 +564,7 @@ class KISApiClient:
         if not rows:
             return None
         row = rows[0]
-        open_flag = str(row.get("opnd_yn", "")).strip().upper()
+        open_flag = self._kis_row_opnd_yn(row)
         if open_flag == "Y":
             return True
         if open_flag == "N":

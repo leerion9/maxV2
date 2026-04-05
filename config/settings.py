@@ -67,6 +67,11 @@ class Settings:
 
     naver_http_delay_sec: float = float(os.getenv("NAVER_HTTP_DELAY_SEC", "0.05") or "0.05")
 
+    # 평일 공휴일 등: 한 줄에 YYYYMMDD 하나. 토·일은 코드에서 별도 처리.
+    holiday_dates_path: Path = Path(
+        os.getenv("HOLIDAY_DATES_PATH", str(ROOT_DIR / "config" / "korea_market_holidays.txt"))
+    )
+
     @property
     def base_url(self) -> str:
         return self.base_url_paper if self.is_paper_trading else self.base_url_live

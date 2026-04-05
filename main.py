@@ -12,6 +12,7 @@ from core.api_client import KISApiClient
 from core.logger import TradeLogger
 from core.order import OrderManager
 from core.strategy import VolatilityBreakoutStrategy
+from core.trading_day import should_run_bot_today_kst
 from core.universe_cache import CachedSymbol, UniverseCache, cache_path, load_cache, save_cache, today_kst_yyyymmdd
 
 
@@ -53,10 +54,19 @@ class MaxVRunner:
 
     def run(self) -> None:
         self._configure_console_utf8()
-        self.logger.info("MaxV started.")
-        self._seed_bought_symbols_from_holdings()
 
         now = self._now_kst_local()
+        ymd_check = now.strftime("%Y%m%d")
+        ok_day, holiday_msg = should_run_bot_today_kst(ymd_check, settings)
+        if not ok_day:
+            print(holiday_msg)
+            self.logger.info(holiday_msg)
+            return
+
+        self.logger.info("MaxV started.")
+
+        self._seed_bought_symbols_from_holdings()
+
         hhmm = now.strftime("%H:%M")
         if hhmm >= "15:30":
             print("장 종료 이후 시간입니다.")

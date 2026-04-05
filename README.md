@@ -16,12 +16,14 @@
 ```text
 maxv/
 ├── config/
-│   └── settings.py
+│   ├── settings.py
+│   └── korea_market_holidays.txt
 ├── core/
 │   ├── api_client.py
 │   ├── logger.py
 │   ├── order.py
 │   ├── strategy.py
+│   ├── trading_day.py
 │   ├── naver_universe.py
 │   ├── naver_symbol_master.py
 │   ├── result_csv.py
@@ -34,7 +36,8 @@ maxv/
 ├── tests/
 │   ├── test_strategy.py
 │   ├── test_api_client.py
-│   └── test_naver_universe.py
+│   ├── test_naver_universe.py
+│   └── test_trading_day.py
 ├── .cursorrules
 ├── .env.example
 ├── main.py
@@ -49,9 +52,11 @@ maxv/
 - `core/logger.py`: 로그/CSV 기록
 - `core/result_csv.py`: KIS 일별체결 기반 `result.csv` 집계(FIFO)
 - `core/naver_symbol_master.py`: 네이버 시총 페이지에서 종목코드·종목명 마스터
+- `core/trading_day.py`: 주말·수동 휴장일 목록으로 기동 여부 판단
 - `main.py`: 실행 엔트리(기동 시간 3분기 로직)
 
 ## 실행 로직(기동 시간 기준)
+- **기동 직후**: 토요일·일요일이거나 `config/korea_market_holidays.txt`에 당일(`YYYYMMDD`)이 있으면 메시지 출력 후 종료합니다. 목록에 없는 평일은 개장일로 간주합니다. 임시공휴일·선거일 등은 매년 파일에 직접 추가하세요. 경로는 `HOLIDAY_DATES_PATH`로 바꿀 수 있습니다.
 - **00:00~08:49**: 네이버에서 유니버스를 준비하고 캐시(`data/universe_cache_YYYYMMDD.json`)를 생성/갱신합니다.
 - **08:50~15:30**: 감시/매수 로직만 수행합니다. (장중에는 자동 매도 로직 없음)
 - **15:30~24:00**: `"장 종료 이후 시간입니다."` 출력 후 종료합니다.
