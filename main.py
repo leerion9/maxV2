@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -28,16 +27,19 @@ class MaxVRunner:
         self.strategy = VolatilityBreakoutStrategy()
 
         self.today_universe: List[str] = []
-        # Running set of symbols we should never buy again during this process.
-        # On (re)start we seed it from current account holdings.
-        self.bought_symbols: set[str] = set()
-        self.cached_cash: int = 0
-        self.cash_updated_at: float = 0.0
-        self.cash_refresh_sec: int = 20
-        self.cached_holdings_count: int = 0
-        self.cached_holdings_rows: List[Dict[str, object]] = []
-        self.holdings_updated_at: float = 0.0
-        self.holdings_refresh_sec: int = 15
+        # Today's buy-order symbols: once we received an order ACK(ord_no),
+        # we never buy the same symbol again today.
+        self.ordered_symbols_today: set[str] = set()
+        self.buy_orders_today: int = 0
+
+        # One-time cash snapshot at 09:00:05(KST).
+        self.cash_snapshot_total: int | None = None
+        self.per_symbol_budget: int | None = None
+        self.cash_snapshot_done: bool = False
+        self.cash_snapshot_failed: bool = False
+        self._next_cash_retry_ts: float = 0.0
+        # Retry interval: keep it gentle to avoid API rejection.
+        self.cash_retry_interval_sec: float = 7.0
         self._last_heartbeat_ts: float = 0.0
         self._hb_cycles: int = 0
         self._hb_scanned: int = 0
@@ -64,8 +66,6 @@ class MaxVRunner:
             return
 
         self.logger.info("MaxV started.")
-
-        self._seed_bought_symbols_from_holdings()
 
         hhmm = now.strftime("%H:%M")
         if hhmm >= "15:30":
@@ -140,22 +140,6 @@ class MaxVRunner:
                     pass
         except Exception:
             return
-
-    def _seed_bought_symbols_from_holdings(self) -> None:
-        """
-        On restart, we must not re-buy symbols already held.
-        We seed bought_symbols from current account holdings once at startup.
-        """
-        try:
-            rows = self._get_holdings_with_cache(force_refresh=True)
-            syms = {str(r.get("symbol", "")).strip() for r in rows if isinstance(r, dict)}
-            self.bought_symbols = {s for s in syms if s}
-            if self.bought_symbols:
-                self.logger.info(
-                    f"보유 종목 감지: {len(self.bought_symbols)}종목 (재매수 방지용)"
-                )
-        except Exception:
-            self.bought_symbols = set()
 
     def _maybe_heartbeat(self, phase: str, message: str) -> bool:
         now_ts = time.time()
@@ -296,7 +280,7 @@ class MaxVRunner:
         if now_hhmm < settings.liquidation_hhmm:
             return
 
-        holdings = self._get_holdings_with_cache(force_refresh=True)
+        holdings = self._get_holdings_safely()
         to_sell: List[Dict[str, object]] = []
         for row in holdings:
             if not isinstance(row, dict):
@@ -323,8 +307,6 @@ class MaxVRunner:
                 self.logger.error(f"SELL submit failed {symbol}: {exc}")
                 continue
             ord_no = str(result.get("ord_no", "") or "")
-            cash_psbl = self._get_cash_with_cache(force_refresh=True)
-            bal = self._get_balance_summary_safely()
             self.logger.log_trade(
                 {
                     "symbol": symbol,
@@ -335,62 +317,49 @@ class MaxVRunner:
                     "fee": "",
                     "tax": "",
                     "order_id": ord_no,
-                    "cash_psbl": cash_psbl,
-                    **bal,
+                    "cash_psbl": "",
+                    "balance_tot_asset": "",
+                    "balance_dnca": "",
+                    "balance_json": "",
                 }
             )
             self.logger.info(
                 f"[매도요청] {symbol} qty={qty} 시장가(08:50 보유전량청산) "
-                f"ord_no={ord_no} cash_psbl={cash_psbl}"
+                f"ord_no={ord_no}"
             )
             time.sleep(0.55)
-
-        try:
-            time.sleep(0.35)
-            rows_h = self._get_holdings_with_cache(force_refresh=True)
-            syms = {str(r.get("symbol", "")).strip() for r in rows_h if isinstance(r, dict)}
-            self.bought_symbols = {s for s in syms if s}
-            self.logger.info(
-                f"08:50 청산 후 재매수 방지 목록 재동기화: {len(self.bought_symbols)}종목 "
-                "(잔고=0이면 장중 신규 매수 가능)"
-            )
-        except Exception as exc:  # noqa: BLE001
-            self.logger.error(f"08:50 청산 후 잔고 동기화 실패: {exc}")
-
-    def _get_balance_summary_safely(self) -> Dict[str, object]:
-        try:
-            out = self.api.get_domestic_balance_summary()
-            o2 = out.get("output2", {}) if isinstance(out, dict) else {}
-            raw = out.get("raw", {}) if isinstance(out, dict) else {}
-            tot_asset = str(o2.get("tot_asst_amt", "")).strip()
-            dnca = str(o2.get("dnca_tot_amt", "")).strip()
-            return {
-                "balance_tot_asset": tot_asset,
-                "balance_dnca": dnca,
-                "balance_json": json.dumps(raw, ensure_ascii=False),
-            }
-        except Exception:
-            return {"balance_tot_asset": "", "balance_dnca": "", "balance_json": ""}
+        self.logger.info("08:50 청산 완료(주문발송). 이후 보유=0으로 가정합니다.")
 
     def monitor_intraday(self) -> None:
         now_kst = self._now_kst_local().strftime("%H:%M")
         if now_kst < settings.monitor_start_hhmm or now_kst > settings.monitor_end_hhmm:
             if self.today_universe:
-                holdings_cnt = self._get_holdings_count_with_cache()
                 self._maybe_heartbeat(
                     "waiting",
-                    f"감시 대기중... now={now_kst} KST "
-                    f"(감시대상={len(self.today_universe)}, 보유={holdings_cnt}/{settings.max_positions})",
+                    f"대기중... now={now_kst} KST watchlist={len(self.today_universe)} "
+                    f"orders={self.buy_orders_today}/{settings.max_positions} "
+                    f"cash_snapshot={'Y' if self.cash_snapshot_done else 'N'}",
                 )
             return
         if not self.today_universe:
             self._maybe_heartbeat("no_watchlist", f"감시대상이 아직 없습니다. 대기중... now={now_kst} KST")
             return
-        can_buy = len(self.bought_symbols) < settings.max_positions
 
-        cash = self._get_cash_with_cache()
-        if cash <= 0:
-            self.logger.error("Cash unavailable. Skip this monitor cycle.")
+        if not self._ensure_cash_snapshot_for_today():
+            hhmmss = self._now_kst_local().strftime("%H:%M:%S")
+            snap_state = "WAIT" if hhmmss < "09:00:05" else "RETRY"
+            self._maybe_heartbeat(
+                "cash_snapshot_wait",
+                f"감시중... now={now_kst} KST watchlist={len(self.today_universe)} "
+                f"orders={self.buy_orders_today}/{settings.max_positions} "
+                f"cash_snapshot={snap_state}(09:00:05~09:05 재시도)",
+            )
+            return
+
+        can_buy = self.buy_orders_today < settings.max_positions
+        budget = int(self.per_symbol_budget or 0)
+        if budget <= 0:
+            self.logger.error("Per-symbol budget invalid. Keep monitoring only.")
             return
 
         self._hb_cycles += 1
@@ -401,7 +370,7 @@ class MaxVRunner:
         cycle_buys = 0
         cycle_skipped_signals = 0
         for symbol in self.today_universe:
-            if symbol in self.bought_symbols:
+            if symbol in self.ordered_symbols_today:
                 continue
 
             cycle_scanned += 1
@@ -435,14 +404,13 @@ class MaxVRunner:
                         "breakout_price": signal.breakout_price,
                         "reason": signal.reason,
                         "action": "SKIP_FULL_CAP",
-                        "note": "최대 보유 도달(주문 스킵)",
+                        "note": "당일 매수 주문 한도 도달(주문 스킵)",
                     }
                 )
                 cycle_skipped_signals += 1
                 continue
 
-            per_symbol_budget = int(cash * settings.allocation_per_symbol)
-            if signal.breakout_price > per_symbol_budget:
+            if signal.breakout_price > budget:
                 self.logger.log_signal(
                     {
                         "symbol": symbol,
@@ -466,20 +434,23 @@ class MaxVRunner:
             )
 
             try:
-                result = self.order.place_breakout_buy(
-                    symbol=symbol,
-                    cash=cash,
-                    breakout_price=signal.breakout_price,
+                result = self.order.place_breakout_buy_with_budget(
+                    symbol=symbol, per_symbol_budget=budget, breakout_price=signal.breakout_price
                 )
             except Exception as exc:  # noqa: BLE001
                 self.logger.error(f"BUY failed {symbol}: {exc}")
                 continue
 
-            qty = self.order.calc_buy_qty(cash=cash, breakout_price=signal.breakout_price)
             ord_no = str(result.get("ord_no", "") or "")
-            self.bought_symbols.add(symbol)
-            cash_psbl_after = self._get_cash_with_cache(force_refresh=True)
-            bal = self._get_balance_summary_safely()
+            if not ord_no:
+                self.logger.error(f"BUY ack missing ord_no: {symbol}. Not counted.")
+                continue
+
+            qty = self.order.calc_buy_qty_with_budget(
+                per_symbol_budget=budget, breakout_price=signal.breakout_price
+            )
+            self.ordered_symbols_today.add(symbol)
+            self.buy_orders_today += 1
             self.logger.log_trade(
                 {
                     "symbol": symbol,
@@ -490,17 +461,17 @@ class MaxVRunner:
                     "fee": "",
                     "tax": "",
                     "order_id": ord_no,
-                    "cash_psbl": cash_psbl_after,
-                    **bal,
+                    "cash_psbl": "",
+                    "balance_tot_asset": "",
+                    "balance_dnca": "",
+                    "balance_json": "",
                 }
             )
             self.logger.info(
-                f"[매수] {symbol} price={signal.breakout_price} qty={qty} "
-                f"ord_no={ord_no} cash_psbl={cash_psbl_after}"
+                f"[매수] {symbol} price={signal.breakout_price} qty={qty} ord_no={ord_no}"
             )
-            cash = self._get_cash_with_cache(force_refresh=True)
             cycle_buys += 1
-            if len(self.bought_symbols) >= settings.max_positions:
+            if self.buy_orders_today >= settings.max_positions:
                 can_buy = False
             time.sleep(0.15)
 
@@ -512,23 +483,16 @@ class MaxVRunner:
         self._hb_skipped_signals += cycle_skipped_signals
 
         hb_cap = ""
-        if len(self.bought_symbols) >= settings.max_positions:
-            hb_cap = (
-                f" (재매수 방지 {len(self.bought_symbols)}종목 ≥ {settings.max_positions}, "
-                "당일 신규 매수 한도 도달·감시만)"
-            )
+        if self.buy_orders_today >= settings.max_positions:
+            hb_cap = " (주문 5건 도달·감시만)"
         emitted = self._maybe_heartbeat(
             "monitoring",
-            "계속 감시중... "
-            f"now={now_kst} KST "
-            f"watchlist={len(self.today_universe)} "
-            f"holdings={self._get_holdings_count_with_cache()}/{settings.max_positions} "
-            f"block={len(self.bought_symbols)}/{settings.max_positions}"
-            f"{hb_cap} "
-            f"cash_cached={'Y' if (time.time() - self.cash_updated_at) < self.cash_refresh_sec else 'N'} "
-            f"(cycles={self._hb_cycles}, scanned={self._hb_scanned}, quote_ok={self._hb_quote_ok}, "
-            f"quote_err={self._hb_quote_err}, signals={self._hb_signals}, buys={self._hb_buys}, "
-            f"skip_full={self._hb_skipped_signals})",
+            "감시중... "
+            f"now={now_kst} KST watchlist={len(self.today_universe)} "
+            f"orders={self.buy_orders_today}/{settings.max_positions} "
+            f"budget={budget}{hb_cap} "
+            f"(cycles={self._hb_cycles}, quote_err={self._hb_quote_err}, "
+            f"signals={self._hb_signals}, buys={self._hb_buys}, skip={self._hb_skipped_signals})",
         )
         if emitted:
             self._reset_heartbeat_counters()
@@ -573,40 +537,60 @@ class MaxVRunner:
         except Exception as exc:  # noqa: BLE001
             self.logger.error(f"result.csv 실패: {exc}")
 
-    def _get_cash_with_cache(self, force_refresh: bool = False) -> int:
-        now_ts = time.time()
-        if (
-            not force_refresh
-            and self.cached_cash > 0
-            and now_ts - self.cash_updated_at < self.cash_refresh_sec
-        ):
-            return self.cached_cash
-        try:
-            cash = self.api.get_cash_balance()
-            self.cached_cash = cash
-            self.cash_updated_at = now_ts
-            return cash
-        except Exception as exc:  # noqa: BLE001
-            self.logger.error(f"CASH failed: {exc}")
-            return self.cached_cash
-
-    def _get_holdings_with_cache(self, force_refresh: bool = False) -> List[Dict[str, object]]:
-        now_ts = time.time()
-        if not force_refresh and now_ts - self.holdings_updated_at < self.holdings_refresh_sec:
-            return list(self.cached_holdings_rows)
+    def _get_holdings_safely(self) -> List[Dict[str, object]]:
         try:
             rows = self.api.get_domestic_balance_positions()
-            self.cached_holdings_rows = list(rows)
-            self.cached_holdings_count = len(rows)
-            self.holdings_updated_at = now_ts
-            return rows
+            return list(rows)
         except Exception as exc:  # noqa: BLE001
             self.logger.error(f"HOLDINGS failed: {exc}")
-            return list(self.cached_holdings_rows)
+            return []
 
-    def _get_holdings_count_with_cache(self) -> int:
-        _ = self._get_holdings_with_cache()
-        return int(self.cached_holdings_count or 0)
+    def _ensure_cash_snapshot_for_today(self) -> bool:
+        """
+        09:00:05(KST)에 주문가능현금을 1회 조회해 고정 예산(5등분)을 만든다.
+        조회 실패 시 09:05:00(KST)까지 적당한 간격으로 재시도한다.
+        """
+        if self.cash_snapshot_done:
+            return True
+        if self.cash_snapshot_failed:
+            return False
+
+        now = self._now_kst_local()
+        hhmmss = now.strftime("%H:%M:%S")
+        if hhmmss < "09:00:05":
+            return False
+        if hhmmss > "09:05:00":
+            self.cash_snapshot_failed = True
+            self.logger.error("현금 스냅샷 조회 실패(09:05 초과). 오늘은 매수 없이 감시만 진행합니다.")
+            return False
+
+        now_ts = time.time()
+        if now_ts < self._next_cash_retry_ts:
+            return False
+        self._next_cash_retry_ts = now_ts + float(self.cash_retry_interval_sec)
+
+        try:
+            cash = int(self.api.get_cash_balance() or 0)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.error(f"CASH snapshot failed: {exc}")
+            return False
+
+        if cash <= 0:
+            self.logger.error(f"CASH snapshot returned invalid cash={cash}. Retry.")
+            return False
+
+        self.cash_snapshot_total = cash
+        self.per_symbol_budget = int(cash // int(settings.max_positions))
+        self.cash_snapshot_done = True
+        self.logger.info(
+            "현금 스냅샷 완료. "
+            f"at={hhmmss} KST "
+            f"cash_total={self.cash_snapshot_total} "
+            f"budget={self.per_symbol_budget} "
+            f"orders_cap={settings.max_positions} "
+            "retry_deadline=09:05:00"
+        )
+        return True
 
 
 if __name__ == "__main__":

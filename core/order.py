@@ -40,9 +40,24 @@ class OrderManager:
             return 0
         return floor(per_symbol_budget / rounded_price)
 
+    def calc_buy_qty_with_budget(self, per_symbol_budget: int, breakout_price: int) -> int:
+        rounded_price = round_to_tick(breakout_price)
+        if rounded_price <= 0:
+            return 0
+        return floor(int(per_symbol_budget) / rounded_price)
+
     def place_breakout_buy(self, symbol: str, cash: int, breakout_price: int) -> dict:
         price = round_to_tick(breakout_price)
         qty = self.calc_buy_qty(cash=cash, breakout_price=price)
+        if qty <= 0:
+            raise ValueError(f"insufficient cash for {symbol}")
+        return self.api.place_limit_buy(symbol=symbol, qty=qty, price=price)
+
+    def place_breakout_buy_with_budget(
+        self, symbol: str, per_symbol_budget: int, breakout_price: int
+    ) -> dict:
+        price = round_to_tick(breakout_price)
+        qty = self.calc_buy_qty_with_budget(per_symbol_budget=per_symbol_budget, breakout_price=price)
         if qty <= 0:
             raise ValueError(f"insufficient cash for {symbol}")
         return self.api.place_limit_buy(symbol=symbol, qty=qty, price=price)
