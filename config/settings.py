@@ -53,14 +53,14 @@ class Settings:
     fee_rate_sell: float = 0.00015
     tax_rate_sell: float = 0.0018
 
-    log_dir: Path = ROOT_DIR / "data" / "logs"
+    # 모의/실전 모드별로 로그·result.csv를 물리적으로 분리한다.
+    log_root_dir: Path = ROOT_DIR / "data" / "logs"
     symbol_master_path: Path = ROOT_DIR / "data" / "kr_symbol_master.json"
     # result.csv·봇 종료 시 마스터가 없거나 오래됐으면 네이버에서 갱신 (주 1회 등)
     symbol_master_auto_refresh: bool = (
         os.getenv("SYMBOL_MASTER_AUTO_REFRESH", "true").lower() == "true"
     )
     symbol_master_max_age_days: int = int(os.getenv("SYMBOL_MASTER_MAX_AGE_DAYS", "7") or "7")
-    result_csv_path: Path = ROOT_DIR / "data" / "logs" / "result.csv"
     result_csv_on_shutdown: bool = os.getenv("RESULT_CSV_ON_SHUTDOWN", "true").lower() == "true"
     # KIS 일별체결 FIFO(전일 매수·당일 매도 짝)용 조회 시작일: 종료일 기준 N일 전 (3개월 이내 API 한도)
     result_csv_kis_lookback_days: int = int(os.getenv("RESULT_CSV_KIS_LOOKBACK_DAYS", "30") or "30")
@@ -75,6 +75,18 @@ class Settings:
     @property
     def base_url(self) -> str:
         return self.base_url_paper if self.is_paper_trading else self.base_url_live
+
+    @property
+    def mode_name(self) -> str:
+        return "paper" if self.is_paper_trading else "live"
+
+    @property
+    def log_dir(self) -> Path:
+        return self.log_root_dir / self.mode_name
+
+    @property
+    def result_csv_path(self) -> Path:
+        return self.log_dir / "result.csv"
 
     @property
     def cano(self) -> str:

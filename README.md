@@ -111,16 +111,17 @@ python -m pytest -q
 
 ## result.csv (매매 정리)
 - **수동**: `python -m scripts.build_result` (당일 KST) 또는 `python -m scripts.build_result --date YYYYMMDD`
-- **자동**: `SHUTDOWN_HHMM`(기본 15:40, KST)에 루프가 도달하면 **그날짜** 기준으로 KIS 일별체결을 조회해 `data/logs/result.csv`에 **append**합니다. (`RESULT_CSV_ON_SHUTDOWN=false`로 끌 수 있음)
+- **자동**: `SHUTDOWN_HHMM`(기본 15:40, KST)에 루프가 도달하면 **그날짜** 기준으로 KIS 일별체결을 조회해 `data/logs/<paper|live>/result.csv`에 **append**합니다. (`RESULT_CSV_ON_SHUTDOWN=false`로 끌 수 있음)
 - 한 줄은 **청산 완료 시** 과거 매수(FIFO) + 당일(지정일) 매도를 합친 형태입니다. 당일 매수만 있고 매도가 없으면 **OPEN** 행(매도 칸 비움)으로 나갈 수 있습니다.
 - 종목명: `data/kr_symbol_master.json`을 사용하고, 없거나 오래되면 네이버에서 갱신(`SYMBOL_MASTER_AUTO_REFRESH`, `SYMBOL_MASTER_MAX_AGE_DAYS`). 수동 갱신: `python -m scripts.update_symbol_master`
 - 조회 구간: `RESULT_CSV_KIS_LOOKBACK_DAYS`(기본 30, 최대 90). **같은 영업일에 스크립트를 여러 번 실행하면 중복 행**이 생길 수 있습니다.
 
 ## 로그 확인
-- `data/logs/system.log`: 스케줄, 유니버스 필터 건수, `result.csv 갱신` 로그
-- `data/logs/trades.csv`: 체결 기록
-- `data/logs/signals.csv`: 장중 시그널 기록(보유한도 도달로 주문 스킵된 케이스 포함)
-- `data/logs/result.csv`: 일별 청산·OPEN 요약(로컬·`.gitignore`)
+- 모의: `data/logs/paper/` / 실전: `data/logs/live/` 로 **자동 분리**됩니다. (`IS_PAPER_TRADING` 기준)
+- `data/logs/<paper|live>/system.log`: 스케줄, 유니버스 필터 건수, `result.csv 갱신` 로그
+- `data/logs/<paper|live>/trades.csv`: 체결 기록
+- `data/logs/<paper|live>/signals.csv`: 장중 시그널 기록(보유한도 도달로 주문 스킵된 케이스 포함)
+- `data/logs/<paper|live>/result.csv`: 일별 청산·OPEN 요약(로컬·`.gitignore`)
 
 ## 중요 메모
 - KIS 요청 제한을 피하기 위해 예수금 조회는 캐시를 사용합니다.
