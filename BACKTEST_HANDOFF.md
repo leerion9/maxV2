@@ -1,7 +1,7 @@
 # 백테스트 handoff (repair_v13 → 00_archive)
 
 > **마지막 갱신**: 2026-06-29  
-> **다음 작업**: (없음 — 1~4번 완료)
+> **다음 작업**: **5번** — 오늘 백테스트 결과 **수동·교차 검증** (2026 뱅크롤 CSV 등)
 
 ---
 
@@ -10,7 +10,10 @@
 | 파일 | 용도 |
 |------|------|
 | **`repair_v13.py`** | baseline — pengo CSV `data/raw/` · **시총 스냅샷** 상위 10% |
-| **`repair_v13_archive.py`** | **수정본** — `00_archive` merged+features · **일별 시총** 상위 10% |
+| **`repair_v13_archive.py`** | **수정본** — `00_archive` merged+features · **일별 시총** 상위 10% · 고정 1천만 + **뱅크롤 연동** 동시 출력 |
+| **`export_bankroll_trades.py`** | 뱅크롤 연동 **매수/매도 이벤트** 시간순 CSV (수동 검증용) |
+| **`repair_v13_pengo.py`** | pengo CSV 변형 스크립트 |
+| **`collector.py`** | 데이터 수집 유틸 |
 
 ### archive 스크립트 실행
 
@@ -85,13 +88,33 @@ python repair_v13_archive.py --start 2020-01-01 --end 2026-05-31 --output backte
 - 이익 **+27.46억** (5,163건) · 손실 **-8.07억** (2,892건)
 - 출력: `backtest_archive_2020_202605.csv` · 실행 ~90초
 
+### 4-2 ✅ 뱅크롤 연동 모드 (`repair_v13_archive.py` 확장)
+
+- 시작 **1억** · 아침 시가 매도 후 `뱅크롤 ÷ 10` 슬롯 · **일 10종** · 10건 초과 **랜덤(seed=42)**
+- MDD: 아침 시가 매도 직후 equity · 년평균 **CAGR**
+
+| 구간 | 체결 | 기간 수익률 | 비고 |
+|------|------|------------|------|
+| 2020~2026-05 | 7,485건 | +3,489,175,737% | 복리·풀투입 → 비현실적 상한 |
+| **2026 단독** | **621건** | **+1,367%** (1억→14.7억) | 수동 검증용 CSV 생성 |
+
+- 검증용 CSV: `backtest_archive_2026_bankroll_trades.csv` (buy/sell 이벤트 1,242행)
+- export: `python export_bankroll_trades.py --start 2026-01-01 --end 2026-05-31`
+- **회계 점검**: 시작 + ΣPnL ≈ 최종 (코드 버그 없음 확인) · 복리 가정 주의
+
+### 5번 ⏭️ 미착수 — 백테스트 결과 검증
+
+- `backtest_archive_2026_bankroll_trades.csv` **수동 검증** (seq·뱅크롤·PnL)
+- 필요 시 개별 종목·일자 archive OHLCV와 대조
+- 뱅크롤 복리 가정 현실화 여부 검토 (슬롯 고정·투입 상한 등)
+
 ---
 
 ## 새 채팅 시작 문장
 
 ```
-c:\cursor\02_maxV2\BACKTEST_HANDOFF.md 읽고 백테스트 4번 이어하기.
+c:\cursor\02_maxV2\BACKTEST_HANDOFF.md 읽고 백테스트 검증 이어하기.
 
-【완료】1~3번 · repair_v13_archive.py in 02_maxV2
-【다음】4번 2020~2026-05 archive 백테스트 실행·결과 보고
+【완료】1~4번 · 뱅크롤 연동 · export_bankroll_trades · git push
+【다음】5번 오늘 백테스트 결과 수동·교차 검증 (2026 CSV 등)
 ```
