@@ -16,6 +16,7 @@ from core.api_client import KISApiClient
 from core.naver_symbol_master import load_or_refresh_symbol_master
 from core.result_csv import (
     append_result_rows,
+    append_result1_rows,
     build_daily_rows_from_kis_range,
     kis_rows_to_execs,
     kis_rows_to_symbol_names,
@@ -52,6 +53,16 @@ def main() -> None:
         f"result.csv: {ymd} {len(daily_rows)}건 추가 (KIS {start_ymd}~{ymd}) "
         f"[KIS raw {len(kis_rows)}행 → exec {len(execs)}건] -> {settings.result_csv_path}"
     )
+    append_result1_rows(
+        settings.result1_csv_path,
+        daily_rows,
+        names,
+        fee_rate_buy=settings.fee_rate_buy,
+        fee_rate_sell=settings.fee_rate_sell,
+        tax_rate_sell=settings.tax_rate_sell,
+        kis_symbol_names=kis_names,
+    )
+    print(f"result_1.csv: {ymd} {len(daily_rows)}건 추가 (수수료·세금 포함) -> {settings.result1_csv_path}")
 
 
 if __name__ == "__main__":

@@ -484,7 +484,7 @@ class MaxVRunner:
 
         hb_cap = ""
         if self.buy_orders_today >= settings.max_positions:
-            hb_cap = " (주문 5건 도달·감시만)"
+            hb_cap = f" (주문 {settings.max_positions}건 도달·감시만)"
         emitted = self._maybe_heartbeat(
             "monitoring",
             "감시중... "
@@ -512,6 +512,7 @@ class MaxVRunner:
             from core.naver_symbol_master import load_or_refresh_symbol_master
             from core.result_csv import (
                 append_result_rows,
+                append_result1_rows,
                 build_daily_rows_from_kis_range,
                 kis_rows_to_execs,
                 kis_rows_to_symbol_names,
@@ -534,6 +535,16 @@ class MaxVRunner:
                 settings.result_csv_path, daily_rows, names, kis_symbol_names=kis_names
             )
             self.logger.info(f"result.csv 갱신: {ymd} ({len(daily_rows)}건, KIS조회 {start_ymd}~{ymd})")
+            append_result1_rows(
+                settings.result1_csv_path,
+                daily_rows,
+                names,
+                fee_rate_buy=settings.fee_rate_buy,
+                fee_rate_sell=settings.fee_rate_sell,
+                tax_rate_sell=settings.tax_rate_sell,
+                kis_symbol_names=kis_names,
+            )
+            self.logger.info(f"result_1.csv 갱신: {ymd} ({len(daily_rows)}건, 수수료·세금 포함)")
         except Exception as exc:  # noqa: BLE001
             self.logger.error(f"result.csv 실패: {exc}")
 

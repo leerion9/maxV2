@@ -528,3 +528,177 @@ def build_round_rows_from_kis(kis_rows: List[Dict[str, Any]]) -> List[Dict[str, 
     execs = kis_rows_to_execs(kis_rows)
     r, _ = fifo_sell_to_round_trips(execs)
     return r
+
+
+# ---------------------------------------------------------------------------
+# result_1.csv — 수수료·세금 포함 순손익 버전
+# ---------------------------------------------------------------------------
+
+def _calc_fee_tax(
+    buy_amt: float,
+    sell_amt: float,
+    fee_rate_buy: float,
+    fee_rate_sell: float,
+    tax_rate_sell: float,
+) -> tuple[int, int]:
+    """매수·매도 수수료 합계 및 거래세 계산 (KIS 관행: 원 단위 절사)."""
+    fee = int(buy_amt * fee_rate_buy) + int(sell_amt * fee_rate_sell)
+    tax = int(sell_amt * tax_rate_sell)
+    return fee, tax
+
+
+def build_all_rows_from_range(execs: List[Exec], from_ymd: str) -> List[Dict[str, Any]]:
+    """
+    from_ymd 이후(포함) 매도 완료 라운드 + 미청산 매수 전체.
+    result_1.csv 초기 백필 또는 전체 재작성 용도.
+    """
+    rounds, remaining = fifo_sell_to_round_trips(execs)
+    out: List[Dict[str, Any]] = []
+
+    for r in rounds:
+        if _ymd_kst(r["sell_ts"]) >= from_ymd:
+            out.append({**r, "kind": "CLOSED"})
+
+    for sym, dq in remaining.items():
+        for lot in list(dq):
+            if _ymd_kst(lot.ts) >= from_ymd:
+                buy_avg = lot.amount / lot.qty if lot.qty else 0.0
+                out.append(
+                    {
+                        "kind": "OPEN",
+                        "symbol": sym,
+                        "buy_ts_last": lot.ts,
+                        "buy_avg": buy_avg,
+                        "buy_qty": lot.qty,
+                        "buy_amt": lot.amount,
+                        "fee": lot.fee,
+                        "tax": lot.tax,
+                    }
+                )
+
+    def _sort_key(r: Dict[str, Any]) -> tuple:
+        if r["kind"] == "CLOSED":
+            return (r["sell_ts"], 0)
+        return (r.get("buy_ts_last") or r.get("buy_ts_first"), 1)  # type: ignore[return-value]
+
+    out.sort(key=_sort_key)
+    return out
+
+
+def _write_result1_rows_inner(
+    fp,
+    rows: List[Dict[str, Any]],
+    symbol_names: Dict[str, str],
+    fee_rate_buy: float,
+    fee_rate_sell: float,
+    tax_rate_sell: float,
+    kis_nm: Dict[str, str],
+    start_no: int,
+    start_cum: float,
+) -> None:
+    cum = start_cum
+    w = csv.DictWriter(fp, fieldnames=RESULT_FIELDS)
+    for i, r in enumerate(rows):
+        no = start_no + i + 1
+        sym = _norm_symbol_6(r["symbol"])
+        name = (symbol_names.get(sym, "") or kis_nm.get(sym, "")).strip()
+        kind = str(r.get("kind", "CLOSED"))
+        buy_ts = r.get("buy_ts_first") or r.get("buy_ts_last")
+
+        if kind == "OPEN":
+            buy_amt = float(r["buy_amt"])
+            buy_fee = int(buy_amt * fee_rate_buy)
+            w.writerow(
+                {
+                    "번호": str(no),
+                    "매수날짜": _fmt_date(buy_ts),
+                    "매수시간": _fmt_time(buy_ts),
+                    "매도날짜": "",
+                    "매도시간": "",
+                    "종목코드": sym,
+                    "종목명": name,
+                    "매수단가": str(int(round(float(r["buy_avg"])))),
+                    "매수수량": str(int(r["buy_qty"])),
+                    "총매수금액": str(int(round(buy_amt))),
+                    "매도단가": "",
+                    "매도수량": "",
+                    "총매도금액": "",
+                    "손익": "",
+                    "수익률": "",
+                    "세금": "0",
+                    "수수료": str(buy_fee),
+                    "누적손익": str(int(round(cum))),
+                }
+            )
+            continue
+
+        sell_ts = r["sell_ts"]
+        buy_amt = float(r["buy_amt"])
+        sell_amt = float(r["sell_amt"])
+        fee, tax = _calc_fee_tax(buy_amt, sell_amt, fee_rate_buy, fee_rate_sell, tax_rate_sell)
+        pnl_net = sell_amt - buy_amt - fee - tax
+        cum += pnl_net
+        pnl_pct = (pnl_net / buy_amt * 100.0) if buy_amt > 0 else 0.0
+        w.writerow(
+            {
+                "번호": str(no),
+                "매수날짜": _fmt_date(buy_ts),
+                "매수시간": _fmt_time(buy_ts),
+                "매도날짜": _fmt_date(sell_ts),
+                "매도시간": _fmt_time(sell_ts),
+                "종목코드": sym,
+                "종목명": name,
+                "매수단가": str(int(round(float(r["buy_avg"])))),
+                "매수수량": str(int(r["buy_qty"])),
+                "총매수금액": str(int(round(buy_amt))),
+                "매도단가": str(int(round(float(r["sell_avg"])))),
+                "매도수량": str(int(r["sell_qty"])),
+                "총매도금액": str(int(round(sell_amt))),
+                "손익": str(int(round(pnl_net))),
+                "수익률": f"{pnl_pct:.4f}",
+                "세금": str(tax),
+                "수수료": str(fee),
+                "누적손익": str(int(round(cum))),
+            }
+        )
+
+
+def append_result1_rows(
+    path: Path,
+    rows: List[Dict[str, Any]],
+    symbol_names: Dict[str, str],
+    fee_rate_buy: float,
+    fee_rate_sell: float,
+    tax_rate_sell: float,
+    kis_symbol_names: Optional[Dict[str, str]] = None,
+) -> None:
+    """result_1.csv에 append. 파일 없으면 헤더 포함 신규 생성."""
+    ensure_result_header(path)
+    prev_cum, max_no = read_last_cumulative_and_max_no(path)
+    kis_nm = kis_symbol_names or {}
+    with path.open("a", newline="", encoding=RESULT_CSV_ENCODING) as fp:
+        _write_result1_rows_inner(
+            fp, rows, symbol_names, fee_rate_buy, fee_rate_sell, tax_rate_sell,
+            kis_nm, start_no=max_no, start_cum=prev_cum,
+        )
+
+
+def create_result1_from_scratch(
+    path: Path,
+    rows: List[Dict[str, Any]],
+    symbol_names: Dict[str, str],
+    fee_rate_buy: float,
+    fee_rate_sell: float,
+    tax_rate_sell: float,
+    kis_symbol_names: Optional[Dict[str, str]] = None,
+) -> None:
+    """result_1.csv를 헤더부터 새로 작성 (기존 파일 덮어쓰기)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    kis_nm = kis_symbol_names or {}
+    with path.open("w", newline="", encoding=RESULT_CSV_ENCODING) as fp:
+        w = csv.DictWriter(fp, fieldnames=RESULT_FIELDS)
+        w.writeheader()
+        _write_result1_rows_inner(
+            fp, rows, symbol_names, fee_rate_buy, fee_rate_sell, tax_rate_sell,
+            kis_nm, start_no=0, start_cum=0.0,
+        )

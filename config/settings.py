@@ -27,8 +27,8 @@ class Settings:
     )
 
     top_market_cap_ratio: float = 0.1
-    max_positions: int = 5
-    allocation_per_symbol: float = 0.2
+    max_positions: int = 3
+    allocation_per_symbol: float = 1.0 / 3
     breakout_k: float = 0.7
     monitor_start_hhmm: str = "09:00"
     monitor_end_hhmm: str = "15:30"
@@ -87,6 +87,10 @@ class Settings:
     @property
     def result_csv_path(self) -> Path:
         return self.log_dir / "result.csv"
+
+    @property
+    def result1_csv_path(self) -> Path:
+        return self.log_dir / "result_1.csv"
 
     @property
     def cano(self) -> str:
