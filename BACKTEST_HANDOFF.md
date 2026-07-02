@@ -2,6 +2,8 @@
 
 > **마지막 갱신**: 2026-06-29  
 > **다음 작업**: **5번** — 오늘 백테스트 결과 **수동·교차 검증** (2026 뱅크롤 CSV 등)
+>
+> 📎 **뱅크롤 복리 + PPT 리포트 작업**은 별도 문서 → [`BACKTEST_PPT_HANDOFF.md`](./BACKTEST_PPT_HANDOFF.md) (data/raw · point-in-time · 조건별 배치 예정)
 
 ---
 
