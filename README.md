@@ -12,6 +12,13 @@
 - 이 저장소 작업 중 AI 응답은 **반드시 한국어 존댓말**로만 진행합니다. (반말 금지)
 - 동일 요청을 반복하지 않도록, 합의된 요구사항/규칙은 문서(README/.cursorrules)에 명시된 내용을 우선합니다.
 
+## Handoff 문서
+
+| 파일 | 내용 |
+|------|------|
+| [BACKTEST_PPT_HANDOFF.md](./BACKTEST_PPT_HANDOFF.md) | 백테스트·PPT 파이프라인 (repair_v13 엔진) |
+| [BACKTEST_LIVE_COMPARE_HANDOFF.md](./BACKTEST_LIVE_COMPARE_HANDOFF.md) | **백테스트 ↔ 실매매** 전략 비교 · `main.py` 수정 체크리스트 (2026-07-04) |
+
 ## 디렉토리
 ```text
 maxv/
