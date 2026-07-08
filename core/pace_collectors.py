@@ -12,6 +12,9 @@ from zoneinfo import ZoneInfo
 from config.settings import Settings
 from core.pace_gate import PaceGateEval
 
+# Excel(Windows) opens CSV as CP949 unless a UTF-8 BOM is present.
+CSV_ENCODING = "utf-8-sig"
+
 
 GATE_FIELDS = [
     "ts",
@@ -80,7 +83,7 @@ LEDGER_DESC_ROW = {
 def _ensure_header(path: Path, fields: List[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
-        with path.open("w", newline="", encoding="utf-8") as fp:
+        with path.open("w", newline="", encoding=CSV_ENCODING) as fp:
             csv.DictWriter(fp, fieldnames=fields).writeheader()
 
 
@@ -92,7 +95,7 @@ def _migrate_header_if_needed(path: Path, fields: List[str]) -> None:
     """
     if not path.exists():
         return
-    with path.open("r", newline="", encoding="utf-8") as fp:
+    with path.open("r", newline="", encoding=CSV_ENCODING) as fp:
         reader = csv.reader(fp)
         try:
             header = next(reader)
@@ -100,9 +103,9 @@ def _migrate_header_if_needed(path: Path, fields: List[str]) -> None:
             header = []
     if header == fields:
         return
-    with path.open("r", newline="", encoding="utf-8") as fp:
+    with path.open("r", newline="", encoding=CSV_ENCODING) as fp:
         rows = list(csv.DictReader(fp))
-    with path.open("w", newline="", encoding="utf-8") as fp:
+    with path.open("w", newline="", encoding=CSV_ENCODING) as fp:
         writer = csv.DictWriter(fp, fieldnames=fields)
         writer.writeheader()
         for row in rows:
@@ -158,7 +161,7 @@ class GateCsvLogger:
             "entered": str(entered).lower(),
             "block_reason": block_reason,
         }
-        with path.open("a", newline="", encoding="utf-8") as fp:
+        with path.open("a", newline="", encoding=CSV_ENCODING) as fp:
             csv.DictWriter(fp, fieldnames=GATE_FIELDS).writerow(row)
 
 
@@ -191,7 +194,7 @@ class ValueProfileLogger:
         path = self._path_for(ymd)
         _ensure_header(path, PROFILE_FIELDS)
         fallback_ts = datetime.now(ZoneInfo("Asia/Seoul")).isoformat(timespec="seconds")
-        with path.open("a", newline="", encoding="utf-8") as fp:
+        with path.open("a", newline="", encoding=CSV_ENCODING) as fp:
             writer = csv.DictWriter(fp, fieldnames=PROFILE_FIELDS)
             for row in rows:
                 writer.writerow({"ts": fallback_ts, **row})
@@ -206,6 +209,7 @@ class PaperLedger:
         _migrate_header_if_needed(self.path, LEDGER_FIELDS)
         _ensure_header(self.path, LEDGER_FIELDS)
         self._ensure_desc_row()
+        self._ensure_excel_bom()
 
     @staticmethod
     def _is_desc_row(row: Dict[str, str]) -> bool:
@@ -213,12 +217,20 @@ class PaperLedger:
 
     def _ensure_desc_row(self) -> None:
         """Insert the Korean description row right below the header (idempotent)."""
-        with self.path.open("r", newline="", encoding="utf-8") as fp:
+        with self.path.open("r", newline="", encoding=CSV_ENCODING) as fp:
             rows = list(csv.DictReader(fp))
         if rows and self._is_desc_row(rows[0]):
             return
         data_rows = [r for r in rows if not self._is_desc_row(r)]
         self._rewrite(data_rows)
+
+    def _ensure_excel_bom(self) -> None:
+        """Rewrite legacy UTF-8 (no BOM) files so Excel on Windows shows Korean."""
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return
+        if self.path.read_bytes()[:3] == b"\xef\xbb\xbf":
+            return
+        self._rewrite(self._read_all())
 
     def append_entry(
         self,
@@ -247,7 +259,7 @@ class PaperLedger:
             "fees_bp": "",
             "net_pnl_open_next_bp": "",
         }
-        with self.path.open("a", newline="", encoding="utf-8") as fp:
+        with self.path.open("a", newline="", encoding=CSV_ENCODING) as fp:
             csv.DictWriter(fp, fieldnames=LEDGER_FIELDS).writerow(row)
 
     def symbols_pending_same_day_close(self, *, ymd: str) -> List[str]:
@@ -366,11 +378,11 @@ class PaperLedger:
         """Data rows only — the '#'-prefixed description row is skipped."""
         if not self.path.exists():
             return []
-        with self.path.open("r", newline="", encoding="utf-8") as fp:
+        with self.path.open("r", newline="", encoding=CSV_ENCODING) as fp:
             return [r for r in csv.DictReader(fp) if not self._is_desc_row(r)]
 
     def _rewrite(self, rows: List[Dict[str, str]]) -> None:
-        with self.path.open("w", newline="", encoding="utf-8") as fp:
+        with self.path.open("w", newline="", encoding=CSV_ENCODING) as fp:
             writer = csv.DictWriter(fp, fieldnames=LEDGER_FIELDS)
             writer.writeheader()
             writer.writerow(LEDGER_DESC_ROW)

@@ -105,7 +105,7 @@ def test_header_migration_from_old_schema(tmp_path):
 
     # 이관 후 append가 헤더와 정렬되는지 확인
     _entry(ledger, ymd="20260706", symbol="000660")
-    with path.open("r", newline="", encoding="utf-8") as fp:
+    with path.open("r", newline="", encoding="utf-8-sig") as fp:
         reader = csv.reader(fp)
         header = next(reader)
         desc = next(reader)
@@ -118,10 +118,28 @@ def test_header_migration_from_old_schema(tmp_path):
 def test_desc_row_on_fresh_ledger(tmp_path):
     ledger = _make_ledger(tmp_path)
     path = ledger.path
-    with path.open("r", newline="", encoding="utf-8") as fp:
+    with path.open("r", newline="", encoding="utf-8-sig") as fp:
         reader = csv.reader(fp)
         header = next(reader)
         desc = next(reader)
     assert header == LEDGER_FIELDS
     assert desc == [LEDGER_DESC_ROW[k] for k in LEDGER_FIELDS]
     assert ledger._read_all() == []
+    assert path.read_bytes()[:3] == b"\xef\xbb\xbf"
+
+
+def test_legacy_utf8_without_bom_migrated_for_excel(tmp_path):
+    path = tmp_path / "paper_ledger.csv"
+    with path.open("w", newline="", encoding="utf-8") as fp:
+        writer = csv.DictWriter(fp, fieldnames=LEDGER_FIELDS)
+        writer.writeheader()
+        writer.writerow({k: LEDGER_DESC_ROW[k] for k in LEDGER_FIELDS})
+    assert path.read_bytes()[:3] != b"\xef\xbb\xbf"
+    ledger = PaperLedger(path=path, settings=_settings())
+    assert path.read_bytes()[:3] == b"\xef\xbb\xbf"
+    with path.open("r", newline="", encoding="utf-8-sig") as fp:
+        reader = csv.reader(fp)
+        next(reader)  # header
+        desc = next(reader)[0]
+    assert desc.startswith("#")
+    assert "YYYYMMDD" in desc or "진입" in desc
