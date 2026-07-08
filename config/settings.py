@@ -27,9 +27,26 @@ class Settings:
     )
 
     top_market_cap_ratio: float = 0.1
-    max_positions: int = 3
-    allocation_per_symbol: float = 1.0 / 3
+    max_positions: int = 5
+    allocation_per_symbol: float = 1.0 / 5
     breakout_k: float = 0.7
+
+    # Pace gate + paper observation mode (WORK_ORDER pace_gate)
+    paper_mode: bool = os.getenv("PAPER_MODE", "true").lower() == "true"
+    paper_capital: int = int(os.getenv("PAPER_CAPITAL", "10000000") or "10000000")
+    pace_threshold: float = float(os.getenv("PACE_THRESHOLD", "3.0") or "3.0")
+    pace_entry_start_hhmm: str = os.getenv("PACE_ENTRY_START_HHMM", "09:10")
+    pace_entry_end_hhmm: str = os.getenv("PACE_ENTRY_END_HHMM", "15:20")
+    pace_chase_limit_mult: float = float(os.getenv("PACE_CHASE_LIMIT_MULT", "1.02") or "1.02")
+    pace_upper_limit_mult: float = float(os.getenv("PACE_UPPER_LIMIT_MULT", "1.25") or "1.25")
+    gate_log_min_interval_sec: int = int(os.getenv("GATE_LOG_MIN_INTERVAL_SEC", "60") or "60")
+    value_profile_interval_sec: int = int(os.getenv("VALUE_PROFILE_INTERVAL_SEC", "300") or "300")
+    # 익일 시가 소급 기입: 09:00 동시호가 이후에만 시가가 존재.
+    paper_open_exit_fill_start_hhmm: str = os.getenv("PAPER_OPEN_EXIT_FILL_START_HHMM", "09:01")
+    paper_open_exit_fill_deadline_hhmm: str = os.getenv(
+        "PAPER_OPEN_EXIT_FILL_DEADLINE_HHMM", "09:30"
+    )
+    pace_log_dir: Path = ROOT_DIR / "logs"
     monitor_start_hhmm: str = "09:00"
     monitor_end_hhmm: str = "15:30"
     shutdown_hhmm: str = os.getenv("SHUTDOWN_HHMM", "15:40")

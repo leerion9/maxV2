@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import FrozenSet, Tuple
 
@@ -31,6 +31,20 @@ def load_manual_holiday_set(path: Path) -> FrozenSet[str]:
         else:
             _log.warning("휴장일 목록에서 무시한 줄: %r", raw[:80])
     return frozenset(out)
+
+
+def prev_trading_day_ymd(ymd: str, holidays: FrozenSet[str], max_lookback_days: int = 30) -> str:
+    """
+    Most recent trading day strictly before `ymd` (weekends + manual holiday
+    list). Returns "" if none found within `max_lookback_days`.
+    """
+    dt = datetime.strptime(ymd, "%Y%m%d")
+    for _ in range(max_lookback_days):
+        dt -= timedelta(days=1)
+        cand = dt.strftime("%Y%m%d")
+        if not _is_weekend_ymd(cand) and cand not in holidays:
+            return cand
+    return ""
 
 
 def should_run_bot_today_kst(ymd: str, settings: Settings) -> Tuple[bool, str]:

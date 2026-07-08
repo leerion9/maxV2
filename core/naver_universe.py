@@ -27,6 +27,56 @@ _MARKET_SUM_URL = "https://finance.naver.com/sise/sise_market_sum.naver"
 _DAY_URL = "https://finance.naver.com/item/sise_day.naver"
 _MAX_PAGES_PER_MARKET = 120
 
+# --- 비(非)보통주 상품 제외 필터 (2026-07-08, 사전 고정) ---
+# ETF/ETN/펀드/스팩/리츠/인프라펀드는 변동성 돌파 검증 표본이 아니므로 제외.
+# 우선주는 발주자 결정에 따라 포함한다.
+# 브랜드 접두어(ETF 상품명은 브랜드로 시작) — 대문자 비교.
+_ETF_BRAND_PREFIXES = (
+    "KODEX",
+    "TIGER",
+    "ACE",
+    "SOL",
+    "PLUS",
+    "RISE",
+    "HANARO",
+    "KIWOOM",
+    "KOSEF",
+    "KBSTAR",
+    "ARIRANG",
+    "WON",
+    "BNK",
+    "TREX",
+    "FOCUS",
+    "KOACT",
+    "TIMEFOLIO",
+    "UNICORN",
+    "1Q",
+    "VITA",
+    "WOORI",
+    "DAISHIN343",
+    "마이다스",
+    "에셋플러스",
+    "마이티",
+    "파워",
+    "히어로즈",
+)
+# 이름 어디에든 포함되면 제외하는 토큰.
+_EXCLUDE_NAME_TOKENS = ("ETN", "스팩", "리츠", "인프라", "선박투자", "펀드")
+
+
+def is_excluded_instrument(name: str) -> bool:
+    """ETF/ETN/펀드/스팩/리츠/인프라펀드 여부 (우선주는 제외하지 않음)."""
+    n = name.strip().upper()
+    if not n:
+        return False
+    for token in _EXCLUDE_NAME_TOKENS:
+        if token in n:
+            return True
+    for prefix in _ETF_BRAND_PREFIXES:
+        if n.startswith(prefix):
+            return True
+    return False
+
 
 class DailyBar(TypedDict):
     date: str
@@ -64,12 +114,13 @@ def _select_ref_index_latest_closed(bars: List[DailyBar], today_dot: str) -> int
     return 0
 
 
-def _parse_market_sum_page(html: str) -> List[Tuple[str, int]]:
+def _parse_market_sum_page(html: str) -> List[Tuple[str, str, int]]:
+    """Returns [(code, name, market_cap), ...]."""
     soup = BeautifulSoup(html, "html.parser")
     table = soup.select_one("table.type_2")
     if not table:
         return []
-    out: List[Tuple[str, int]] = []
+    out: List[Tuple[str, str, int]] = []
     for tr in table.select("tbody tr"):
         tds = tr.find_all("td")
         if len(tds) < 10:
@@ -83,12 +134,22 @@ def _parse_market_sum_page(html: str) -> List[Tuple[str, int]]:
         cap_txt = tds[6].get_text(strip=True).replace(",", "")
         if not cap_txt.isdigit():
             continue
-        out.append((m.group(1), int(cap_txt)))
+        name = a.get_text(strip=True)
+        out.append((m.group(1), name, int(cap_txt)))
     return out
 
 
-def _fetch_ranked_symbols_merged(session: requests.Session, delay_sec: float) -> List[str]:
+def _fetch_ranked_symbols_merged(
+    session: requests.Session, delay_sec: float
+) -> Tuple[List[str], int]:
+    """
+    Market-cap-ranked common-stock codes (KOSPI+KOSDAQ merged).
+    ETF/ETN/펀드/스팩/리츠/인프라펀드는 랭킹 산정 전에 제외한다 — 시총 상위
+    top_ratio 컷의 분모가 보통주(+우선주) 집합이 되도록.
+    Returns (ordered_codes, excluded_count).
+    """
     merged: Dict[str, int] = {}
+    excluded = 0
     for sosok in (0, 1):
         for page in range(1, _MAX_PAGES_PER_MARKET + 1):
             resp = session.get(
@@ -101,11 +162,14 @@ def _fetch_ranked_symbols_merged(session: requests.Session, delay_sec: float) ->
             rows = _parse_market_sum_page(resp.text)
             if not rows:
                 break
-            for code, cap in rows:
+            for code, name, cap in rows:
+                if is_excluded_instrument(name):
+                    excluded += 1
+                    continue
                 merged[code] = max(merged.get(code, 0), cap)
             time.sleep(delay_sec)
     ordered = [c for c, _ in sorted(merged.items(), key=lambda x: -x[1])]
-    return ordered
+    return ordered, excluded
 
 
 def _fetch_daily_bars(session: requests.Session, symbol: str) -> List[DailyBar]:
@@ -157,9 +221,9 @@ def build_naver_universe(top_ratio: float, delay_sec: float) -> Tuple[List[str],
     session = requests.Session()
     session.headers.update(_UA)
 
-    ranked = _fetch_ranked_symbols_merged(session, delay_sec=delay_sec)
+    ranked, excluded = _fetch_ranked_symbols_merged(session, delay_sec=delay_sec)
     if not ranked:
-        return [], {"naver_ranked": 0, "top_n": 0, "ma5_pass": 0, "daily_fail": 0}
+        return [], {"naver_ranked": 0, "top_n": 0, "ma5_pass": 0, "daily_fail": 0, "excluded": 0}
 
     top_n = max(1, int(len(ranked) * top_ratio))
     candidates = ranked[:top_n]
@@ -186,10 +250,12 @@ def build_naver_universe(top_ratio: float, delay_sec: float) -> Tuple[List[str],
         "top_n": top_n,
         "ma5_pass": len(selected),
         "daily_fail": daily_fail,
+        "excluded": excluded,
     }
     _log.info(
-        "Naver universe (compare): ranked=%s top_ratio=%s -> top_n=%s ma5_pass=%s daily_fail=%s",
+        "Naver universe (compare): ranked=%s excluded=%s top_ratio=%s -> top_n=%s ma5_pass=%s daily_fail=%s",
         len(ranked),
+        excluded,
         top_ratio,
         top_n,
         len(selected),
@@ -210,9 +276,9 @@ def build_naver_universe_with_features(
     session = requests.Session()
     session.headers.update(_UA)
 
-    ranked = _fetch_ranked_symbols_merged(session, delay_sec=delay_sec)
+    ranked, excluded = _fetch_ranked_symbols_merged(session, delay_sec=delay_sec)
     if not ranked:
-        return [], {}, {"naver_ranked": 0, "top_n": 0, "ma5_pass": 0, "daily_fail": 0}
+        return [], {}, {"naver_ranked": 0, "top_n": 0, "ma5_pass": 0, "daily_fail": 0, "excluded": 0}
 
     top_n = max(1, int(len(ranked) * top_ratio))
     candidates = ranked[:top_n]
@@ -235,12 +301,17 @@ def build_naver_universe_with_features(
 
             vols = [b["volume"] for b in bars[ref_i : ref_i + 5]]
             avg_vol_5d = int(sum(vols) / 5)
+            # value_ma5: sum(close*volume)/5 (Naver has no trading_value field)
+            values = [b["close"] * b["volume"] for b in bars[ref_i : ref_i + 5]]
+            value_ma5 = int(sum(values) / 5)
             prev = bars[ref_i]
             selected.append(symbol)
             features[symbol] = {
                 "avg_volume_5d": avg_vol_5d,
                 "prev_high": int(prev["high"]),
                 "prev_low": int(prev["low"]),
+                "value_ma5": value_ma5,
+                "prev_close": int(prev["close"]),
             }
         except Exception:  # noqa: BLE001
             daily_fail += 1
@@ -251,10 +322,12 @@ def build_naver_universe_with_features(
         "top_n": top_n,
         "ma5_pass": len(selected),
         "daily_fail": daily_fail,
+        "excluded": excluded,
     }
     _log.info(
-        "Naver universe: ranked=%s top_ratio=%s -> top_n=%s ma5_pass=%s daily_fail=%s",
+        "Naver universe: ranked=%s excluded=%s top_ratio=%s -> top_n=%s ma5_pass=%s daily_fail=%s",
         len(ranked),
+        excluded,
         top_ratio,
         top_n,
         len(selected),

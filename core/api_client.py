@@ -39,6 +39,8 @@ class Quote:
     current_price: int
     open_price: int
     volume: int
+    # acml_tr_pbmn: 당일 누적 거래대금 (KIS 국내주식 현재가, 단위: 원 KRW)
+    cum_value: int
     prev_high: int
     prev_low: int
 
@@ -359,6 +361,7 @@ class KISApiClient:
             current_price=abs(int(output["stck_prpr"])),
             open_price=abs(int(output["stck_oprc"])),
             volume=abs(int(output["acml_vol"])),
+            cum_value=abs(int(output.get("acml_tr_pbmn", "0") or "0")),
             prev_high=abs(int(output["stck_hgpr"])),
             prev_low=abs(int(output["stck_lwpr"])),
         )
@@ -572,6 +575,8 @@ class KISApiClient:
         return None
 
     def place_limit_buy(self, symbol: str, qty: int, price: int) -> Dict[str, str]:
+        if getattr(self.settings, "paper_mode", False):
+            raise RuntimeError("paper_mode: place_limit_buy blocked")
         url = f"{self.settings.base_url}/uapi/domestic-stock/v1/trading/order-cash"
         body = {
             "CANO": self.settings.cano,
@@ -585,6 +590,8 @@ class KISApiClient:
         return self._post_order(url, body, tr_id)
 
     def place_market_sell(self, symbol: str, qty: int) -> Dict[str, str]:
+        if getattr(self.settings, "paper_mode", False):
+            raise RuntimeError("paper_mode: place_market_sell blocked")
         url = f"{self.settings.base_url}/uapi/domestic-stock/v1/trading/order-cash"
         body = {
             "CANO": self.settings.cano,

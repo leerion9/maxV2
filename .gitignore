@@ -5,3 +5,4 @@ __pycache__/
 data/
 _ppt_charts/
 backtest_*.csv
+logs/

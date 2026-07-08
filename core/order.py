@@ -47,6 +47,7 @@ class OrderManager:
         return floor(int(per_symbol_budget) / rounded_price)
 
     def place_breakout_buy(self, symbol: str, cash: int, breakout_price: int) -> dict:
+        self._block_if_paper_mode()
         price = round_to_tick(breakout_price)
         qty = self.calc_buy_qty(cash=cash, breakout_price=price)
         if qty <= 0:
@@ -56,6 +57,7 @@ class OrderManager:
     def place_breakout_buy_with_budget(
         self, symbol: str, per_symbol_budget: int, breakout_price: int
     ) -> dict:
+        self._block_if_paper_mode()
         price = round_to_tick(breakout_price)
         qty = self.calc_buy_qty_with_budget(per_symbol_budget=per_symbol_budget, breakout_price=price)
         if qty <= 0:
@@ -63,7 +65,12 @@ class OrderManager:
         return self.api.place_limit_buy(symbol=symbol, qty=qty, price=price)
 
     def place_open_liquidation(self, symbol: str, qty: int) -> dict:
+        self._block_if_paper_mode()
         return self.api.place_market_sell(symbol=symbol, qty=qty)
+
+    def _block_if_paper_mode(self) -> None:
+        if getattr(self.settings, "paper_mode", False):
+            raise RuntimeError("paper_mode: order API call blocked")
 
     def estimate_sell_cost(self, amount: int) -> tuple[float, float]:
         fee = amount * self.settings.fee_rate_sell
