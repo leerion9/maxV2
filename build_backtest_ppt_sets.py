@@ -16,6 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import matplotlib
+import pandas as pd
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -295,6 +296,49 @@ PRESETS: dict[str, dict] = {
         "subtitle": "기준(≥300%) · 거래대금 구간별(50~100%…600%+) 비교 · 뱅크롤 1억 복리",
         "chart_tag": "vol_bands",
     },
+    "breakout_range": {
+        "sets": [
+            {
+                "key": "base",
+                "name": "기준 (baseline)",
+                "short": "기준\n300%",
+                "sub": "K=0.7 · 시총 상위10% · MA5 · 당일 거래대금 300% · 익일 시가 · 비용 1%",
+                "over": {},
+            },
+            {
+                "key": "no_vol_range",
+                "name": "세트2 · 거래대금 제거 + 기준가 구간",
+                "short": "거래대금X\n구간필터",
+                "sub": "거래대금 필터 제거 · 고가≥기준가 · 저가<기준가<고가 (나머지 기준 동일)",
+                "over": {"use_volume": False, "require_target_in_range": True},
+            },
+        ],
+        "out": "repair_v13_breakout_range_sets_compare.pptx",
+        "subtitle": "기준 · 거래대금 제거+기준가 구간(저가<기준가<고가) 비교 · 뱅크롤 1억 복리",
+        "chart_tag": "breakout_range",
+        "range_analysis": True,
+    },
+    "prev_high_range": {
+        "sets": [
+            {
+                "key": "base",
+                "name": "기준 (baseline)",
+                "short": "기준\n300%",
+                "sub": "K=0.7 · 시총 상위10% · MA5 · 당일 거래대금 300% · 익일 시가 · 비용 1%",
+                "over": {},
+            },
+            {
+                "key": "prev_high",
+                "name": "세트2 · 전일고가 구간 + 거래대금 제거",
+                "short": "전일고가\n거래대금X",
+                "sub": "거래대금 제거 · 저가<전일고가<당일고가 추가 · 고가≥기준가 (나머지 기준 동일)",
+                "over": {"use_volume": False, "require_prev_high_in_range": True},
+            },
+        ],
+        "out": "repair_v13_prev_high_range_sets_compare.pptx",
+        "subtitle": "기준 · 전일고가 구간(저가<전일고<당일고)+거래대금제거 비교 · 뱅크롤 1억 복리",
+        "chart_tag": "prev_high_range",
+    },
 }
 
 
@@ -460,6 +504,54 @@ def add_compare_chart_slide(prs: Presentation, chart: Path) -> None:
     s.shapes.add_picture(str(chart), x, Inches(1.5), height=h)
 
 
+def add_range_rejection_slide(prs: Presentation, stats: dict[str, int]) -> None:
+    """세트2 구간 필터 — 저가<기준가 미충족 제외 건수."""
+    s = _blank(prs)
+    _bg(s, WHITE)
+    _title(s, "세트2 · 기준가 구간 필터 제외 건수")
+
+    loose = stats["loose"]
+    strict = stats["strict"]
+    rej_low = stats["rejected_not_above_low"]
+    rej_high = stats["rejected_not_below_high"]
+    pct = (rej_low / loose * 100) if loose else 0.0
+
+    rows = [
+        ["구분", "건수", "설명"],
+        [
+            "A. loose 신호 (거래대금 제거)",
+            f"{loose:,}건",
+            "시총·MA5·고가≥기준가 충족 (구간 필터 없음)",
+        ],
+        [
+            "B. strict 신호 (세트2 적용)",
+            f"{strict:,}건",
+            "A + 저가 < 기준가 < 고가",
+        ],
+        [
+            "C. 저가<기준가 미충족 제외",
+            f"{rej_low:,}건",
+            "A 충족이나 기준가 ≤ 당일 저가 (갭상승 등)",
+        ],
+        [
+            "C / A 비율",
+            f"{pct:.2f}%",
+            "전체 loose 신호 중 저가 조건으로만 제외된 비율",
+        ],
+        [
+            "D. 기준가≥고가 제외 (참고)",
+            f"{rej_high:,}건",
+            "A 충족·저가<기준가이나 기준가 ≥ 고가 (경계)",
+        ],
+    ]
+    bp._table(s, Inches(0.5), Inches(1.35), Inches(12.4), rows, col_w=[Inches(3.2), Inches(2.0), Inches(7.2)])
+    _box(
+        s, Inches(0.5), Inches(6.85), Inches(12.4), Inches(0.55),
+        "※ 세트2는 거래대금 필터 없음 · 매수 체결은 돌파가(target) · 검증 A=loose / B=strict / C=저가 미충족",
+        11, color=RGBColor(0x60, 0x66, 0x72),
+    )
+
+
 # ---------------------------------------------------------------- 드라이버
 def build_sets_report(
     results: list[dict],
@@ -467,6 +559,7 @@ def build_sets_report(
     *,
     subtitle: str,
     chart_tag: str,
+    range_stats: dict[str, int] | None = None,
 ) -> Path:
     prs = Presentation()
     prs.slide_width = SLIDE_W
@@ -481,6 +574,8 @@ def build_sets_report(
     add_cover(prs, period_line, subtitle)
     add_summary_table(prs, results)
     add_compare_chart_slide(prs, cmp_chart)
+    if range_stats is not None:
+        add_range_rejection_slide(prs, range_stats)
 
     print("▶ 세트별 상세 슬라이드 생성...")
     for r in results:
@@ -515,15 +610,46 @@ def main() -> None:
     sets = cfg["sets"]
 
     print(f"▶ 조건 세트 배치 백테스트 시작 (preset={args.preset})")
-    results = run_all_sets(sets, verbose=True)
+    frames = bl.load_frames(**COMMON, verbose=True)
+    results: list[dict] = []
+    for spec in sets:
+        print(f"\n▶ [{spec['name']}] 백테스트 실행...")
+        res = bl.run_baseline(**COMMON, frames=frames, verbose=False, **spec["over"])
+        if not res:
+            print(f"❌ [{spec['name']}] 결과 없음 — 건너뜀")
+            continue
+        b = res["bankroll"]
+        fx = res["fixed"]
+        print(
+            f"   고정 {fx['trades']:,}건·승률 {fx['win_rate']:.2f}%·순손익 {_fmt_money(fx['net_pnl'])}"
+            f" | 뱅크롤 최종 {_fmt_money(b['final_bankroll'])}·CAGR {b['cagr']:+,.1f}%·MDD {b['mdd']:.2f}%"
+        )
+        results.append({**spec, "res": res})
     if not results:
         print("❌ 실행된 세트가 없습니다.")
         return
+
+    range_stats = None
+    if cfg.get("range_analysis"):
+        start_ts = pd.Timestamp(COMMON["start"])
+        end_ts = pd.Timestamp(COMMON["end"])
+        cutoffs = bl._build_daily_cutoffs(frames, 0.1, ratio_hi=None, side="top")
+        range_stats = bl.count_all_breakout_rejected_not_above_low(
+            frames, cutoffs, start_ts, end_ts,
+        )
+        print(
+            f"\n▶ 구간 필터 제외 분석: loose={range_stats['loose']:,}건 · "
+            f"strict={range_stats['strict']:,}건 · "
+            f"저가<기준가 미충족={range_stats['rejected_not_above_low']:,}건 "
+            f"({range_stats['rejected_not_above_low'] / range_stats['loose'] * 100 if range_stats['loose'] else 0:.2f}%)"
+        )
+
     build_sets_report(
         results,
         cfg["out"],
         subtitle=cfg["subtitle"],
         chart_tag=cfg["chart_tag"],
+        range_stats=range_stats,
     )
 
 

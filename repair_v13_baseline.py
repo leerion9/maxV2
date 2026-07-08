@@ -144,6 +144,8 @@ def _extract_signals_pit(
     use_volume: bool = True,
     buy_price_mode: str = "target",
     require_breakout: bool = True,
+    require_target_in_range: bool = False,
+    require_prev_high_in_range: bool = False,
     mcap_side: str = "top",
 ) -> list[dict]:
     df = df.copy()
@@ -189,6 +191,11 @@ def _extract_signals_pit(
     cond = df["mcap_ok"] & df["vol_spike"]
     if require_breakout:
         cond = cond & (df["High"] >= df["target"])
+    if require_target_in_range:
+        cond = cond & (df["Low"] < df["target"]) & (df["target"] < df["High"])
+    if require_prev_high_in_range:
+        prev_high = df["High"].shift(1)
+        cond = cond & (df["Low"] < prev_high) & (prev_high < df["High"])
     if use_ma5:
         cond = cond & df["market_ok"]
     df["is_buy"] = cond
@@ -231,6 +238,85 @@ def _extract_signals_pit(
             }
         )
     return signals
+
+
+def count_breakout_rejected_not_above_low(
+    ticker: str,
+    df: pd.DataFrame,
+    cutoffs: pd.DataFrame,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    *,
+    K: float,
+    use_ma5: bool,
+    mcap_lag: int = 1,
+    band: bool = False,
+    mcap_side: str = "top",
+    use_volume: bool = False,
+) -> dict[str, int]:
+    """거래대금 제거·고가≥기준가(loose) 대비 저가<기준가 미충족 등 구간 제외 건수."""
+    df = df.copy()
+    df["range"] = df["High"].shift(1) - df["Low"].shift(1)
+    df["target"] = df["Open"] + df["range"] * K
+    df["MA5"] = df["Close"].rolling(window=5).mean()
+    df["market_ok"] = df["Close"].shift(1) > df["MA5"].shift(1)
+
+    df = df.merge(cutoffs.reset_index(), on="Date", how="left")
+    if mcap_side == "bottom":
+        mcap_ok_raw = df["MarketCap"].notna() & (df["MarketCap"] <= df["mcap_cut_hi"])
+    elif band:
+        mcap_ok_raw = (
+            df["MarketCap"].notna()
+            & (df["MarketCap"] >= df["mcap_cut_lo"])
+            & (df["MarketCap"] < df["mcap_cut_hi"])
+        )
+    else:
+        mcap_ok_raw = df["MarketCap"].notna() & (df["MarketCap"] >= df["mcap_cut_lo"])
+    df["mcap_ok"] = mcap_ok_raw.shift(mcap_lag).eq(True)
+
+    loose = df["mcap_ok"] & (df["High"] >= df["target"])
+    if use_ma5:
+        loose = loose & df["market_ok"]
+    rejected_low = loose & (df["Low"] >= df["target"])
+    rejected_high = loose & (df["Low"] < df["target"]) & (df["target"] >= df["High"])
+    strict = loose & (df["Low"] < df["target"]) & (df["target"] < df["High"])
+
+    in_period = (df["Date"] >= start_ts) & (df["Date"] <= end_ts)
+    mask = in_period
+    return {
+        "loose": int((mask & loose).sum()),
+        "strict": int((mask & strict).sum()),
+        "rejected_not_above_low": int((mask & rejected_low).sum()),
+        "rejected_not_below_high": int((mask & rejected_high).sum()),
+    }
+
+
+def count_all_breakout_rejected_not_above_low(
+    frames: dict[str, pd.DataFrame],
+    cutoffs: pd.DataFrame,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    *,
+    K: float = 0.7,
+    use_ma5: bool = True,
+    mcap_lag: int = 1,
+    band: bool = False,
+    mcap_side: str = "top",
+) -> dict[str, int]:
+    totals = {
+        "loose": 0,
+        "strict": 0,
+        "rejected_not_above_low": 0,
+        "rejected_not_below_high": 0,
+    }
+    for ticker, df in frames.items():
+        part = count_breakout_rejected_not_above_low(
+            ticker, df, cutoffs, start_ts, end_ts,
+            K=K, use_ma5=use_ma5, mcap_lag=mcap_lag, band=band, mcap_side=mcap_side,
+        )
+        for k in totals:
+            totals[k] += part[k]
+    return totals
 
 
 def load_frames(
@@ -278,6 +364,8 @@ def run_baseline(
     use_volume: bool = True,
     buy_price_mode: str = "target",
     require_breakout: bool = True,
+    require_target_in_range: bool = False,
+    require_prev_high_in_range: bool = False,
     mcap_side: str = "top",
     seed: int = rv.RANDOM_SEED,
     cost_mult: float = rv.COST_MULT,
@@ -298,6 +386,10 @@ def run_baseline(
         mcap_label = f"상위 {mcap_ratio*100:.0f}%"
     buy_label = "당일 종가" if buy_price_mode == "close" else "돌파가(target)"
     breakout_label = "적용" if require_breakout else "미적용"
+    if require_target_in_range:
+        breakout_label += " + 저가<기준가<고가"
+    if require_prev_high_in_range:
+        breakout_label += " + 저가<전일고가<당일고가"
     sell_label = "당일 종가" if sell_mode == "same_close" else "익일 시가"
     if not use_volume:
         vol_label = "거래대금 필터 제거"
@@ -336,6 +428,8 @@ def run_baseline(
                 use_ma5=use_ma5, mcap_lag=mcap_lag,
                 band=band, sell_mode=sell_mode, vol_lag=vol_lag, use_volume=use_volume,
                 buy_price_mode=buy_price_mode, require_breakout=require_breakout,
+                require_target_in_range=require_target_in_range,
+                require_prev_high_in_range=require_prev_high_in_range,
                 mcap_side=mcap_side,
             )
         )
@@ -387,6 +481,8 @@ def run_baseline(
             "use_volume": use_volume,
             "buy_price_mode": buy_price_mode,
             "require_breakout": require_breakout,
+            "require_target_in_range": require_target_in_range,
+            "require_prev_high_in_range": require_prev_high_in_range,
             "mcap_side": mcap_side,
         },
     )

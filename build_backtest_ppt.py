@@ -402,7 +402,12 @@ def _buy_base_label(p: dict) -> str:
 
 def _breakout_label(p: dict) -> str:
     if p.get("require_breakout", True):
-        return "당일 고가 ≥ 시가 + (전일 고−저) × K"
+        base = "당일 고가 ≥ 시가 + (전일 고−저) × K"
+        if p.get("require_target_in_range"):
+            base += " · 저가 < 기준가 < 고가"
+        if p.get("require_prev_high_in_range"):
+            base += " · 저가 < 전일 고가 < 당일 고가"
+        return base
     return "미적용"
 
 
