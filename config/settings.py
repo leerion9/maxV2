@@ -39,10 +39,11 @@ class Settings:
     enable_k_range: bool = _env_bool("ENABLE_K_RANGE", "true")
     enable_prev_high: bool = _env_bool("ENABLE_PREV_HIGH", "true")
     enable_opening_drive: bool = _env_bool("ENABLE_OPENING_DRIVE", "true")
+    enable_theme_map: bool = _env_bool("ENABLE_THEME_MAP", "true")
 
     # Pace gate + paper observation mode (WORK_ORDER pace_gate)
     paper_mode: bool = os.getenv("PAPER_MODE", "true").lower() == "true"
-    # Per-strategy paper capital (K / prev_high / OD each get this amount).
+    # Per-strategy paper capital (K / prev_high / OD / theme each get this amount).
     paper_capital: int = int(os.getenv("PAPER_CAPITAL", "10000000") or "10000000")
     pace_threshold: float = float(os.getenv("PACE_THRESHOLD", "3.0") or "3.0")
     pace_entry_start_hhmm: str = os.getenv("PACE_ENTRY_START_HHMM", "09:10")
@@ -60,6 +61,7 @@ class Settings:
     paper_ledger_k_name: str = "paper_ledger.csv"
     paper_ledger_prev_high_name: str = "paper_ledger_prev_high.csv"
     paper_ledger_od_name: str = "paper_ledger_opening_drive.csv"
+    paper_ledger_theme_name: str = "paper_ledger_theme_map.csv"
 
     # Opening Drive (fixed mock set from HANDOFF)
     od_gap_min: float = float(os.getenv("OD_GAP_MIN", "0.015") or "0.015")
@@ -70,6 +72,23 @@ class Settings:
     od_force_exit_hhmm: str = os.getenv("OD_FORCE_EXIT_HHMM", "11:00")
     od_min_pace_ratio: float = float(os.getenv("OD_MIN_PACE_RATIO", "1.5") or "1.5")
     od_max_positions: int = int(os.getenv("OD_MAX_POSITIONS", "5") or "5")
+
+    # Theme map (Naver weekly CSV + intraday follower)
+    theme_map_path: Path = Path(
+        os.getenv("THEME_MAP_PATH", str(ROOT_DIR / "config" / "theme_map.csv"))
+    )
+    theme_max_members: int = int(os.getenv("THEME_MAX_MEMBERS", "12") or "12")
+    theme_min_members: int = int(os.getenv("THEME_MIN_MEMBERS", "4") or "4")
+    theme_hot_ret: float = float(os.getenv("THEME_HOT_RET", "0.02") or "0.02")
+    theme_hot_ratio: float = float(os.getenv("THEME_HOT_RATIO", "0.50") or "0.50")
+    theme_entry_start_hhmm: str = os.getenv("THEME_ENTRY_START_HHMM", "09:10")
+    theme_entry_end_hhmm: str = os.getenv("THEME_ENTRY_END_HHMM", "14:30")
+    theme_stop_pct: float = float(os.getenv("THEME_STOP_PCT", "0.02") or "0.02")
+    theme_trail_pct: float = float(os.getenv("THEME_TRAIL_PCT", "0.02") or "0.02")
+    theme_force_exit_hhmm: str = os.getenv("THEME_FORCE_EXIT_HHMM", "14:50")
+    theme_min_pace_ratio: float = float(os.getenv("THEME_MIN_PACE_RATIO", "1.5") or "1.5")
+    theme_max_positions: int = int(os.getenv("THEME_MAX_POSITIONS", "5") or "5")
+    theme_max_themes: int = int(os.getenv("THEME_MAX_THEMES", "2") or "2")
 
     monitor_start_hhmm: str = "09:00"
     monitor_end_hhmm: str = "15:30"
@@ -167,10 +186,20 @@ class Settings:
             raise ValueError("WATCHLIST_SAMPLE_SIZE는 0 이상이어야 합니다. 예: 10")
         if self.result_csv_kis_lookback_days < 1 or self.result_csv_kis_lookback_days > 90:
             raise ValueError("RESULT_CSV_KIS_LOOKBACK_DAYS는 1~90(3개월 이내)이어야 합니다.")
-        if not (self.enable_k_range or self.enable_prev_high or self.enable_opening_drive):
-            raise ValueError("ENABLE_K_RANGE / ENABLE_PREV_HIGH / ENABLE_OPENING_DRIVE 중 하나 이상 true")
+        if not (
+            self.enable_k_range
+            or self.enable_prev_high
+            or self.enable_opening_drive
+            or self.enable_theme_map
+        ):
+            raise ValueError(
+                "ENABLE_K_RANGE / ENABLE_PREV_HIGH / ENABLE_OPENING_DRIVE / "
+                "ENABLE_THEME_MAP 중 하나 이상 true"
+            )
         if self.od_gap_min >= self.od_gap_max:
             raise ValueError("OD_GAP_MIN must be < OD_GAP_MAX")
+        if self.theme_min_members < 1 or self.theme_max_members < self.theme_min_members:
+            raise ValueError("THEME_MIN_MEMBERS / THEME_MAX_MEMBERS invalid")
 
 
 settings = Settings()

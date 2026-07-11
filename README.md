@@ -4,14 +4,20 @@
 
 > **2026-07-06 페이스 게이트 재설계**: 현재는 **페이퍼(관찰) 모드**(`PAPER_MODE=true`, 기본값)로 운용 중이며, 실주문은 발송되지 않습니다. 진입의 거래량 조건은 구 "조건 A(누적 거래량 ≥ 5일평균)"에서 **실시간 거래대금 페이스 게이트**로 전면 교체되었습니다. 명세 원본: `c:\cursor\04_fable5\WORK_ORDER_pace_gate.md`
 
-## 핵심 전략 (2026-07-11 — 3전략 병행 페이퍼)
-- `python main.py` 한 번으로 K 돌파·전일고가·Opening Drive를 **동시** 운용합니다 (전략별 독립 뱅크롤·원장).
+## 핵심 전략 (2026-07-11 — 4전략 병행 페이퍼)
+- `python main.py` 한 번으로 아래를 **동시** 운용합니다 (전략별 독립 뱅크롤·원장).
   1. **K 돌파** (`ENABLE_K_RANGE`) → `logs/paper_ledger.csv`
   2. **전일고가** (`ENABLE_PREV_HIGH`) → `logs/paper_ledger_prev_high.csv`
   3. **Opening Drive** (`ENABLE_OPENING_DRIVE`, 당일청산) → `logs/paper_ledger_opening_drive.csv`
+  4. **테마맵** (`ENABLE_THEME_MAP`, 당일청산) → `logs/paper_ledger_theme_map.csv`
+- 테마맵: 매주 금요일 장후 `python -m scripts.update_theme_map`로 `config/theme_map.csv` 갱신.
+  - 테마 내 종목 **12개 초과** → `eligible=0` (매매 후보 제외)
+  - 장중: 핫테마(당일 +2% 이상 비중 ≥50%) → 후발주(테마 중앙 수익률 미만) 당일고점 돌파 + pace≥1.5
+  - 청산: 손절/트레일 −2%, 테마 붕괴, **14:50** 강제청산
 - 유니버스: **보통주+우선주** 중 전일 시총 상위 10% + 전일 종가 > MA5 (네이버 기반, 전일 확정)
   - **제외**: ETN·스팩·리츠·인프라·선박투자·(일반)펀드 — 이름 규칙 (`core/naver_universe.py`). **ETF는 제외하지 않음**(시총 상위 10%+MA5로 편입). `메리츠`→`리츠` 오탐 방지 포함.
   - **포함**: 우선주, **대형 ETF**(네이버 시총 값 기준 상위권)
+  - 테마맵 감시 종목은 유니버스 밖이어도 CSV 멤버면 별도 폴링
 - 진입 (09:10~15:20 KST, 아래 전부 충족 시):
   - 현재가 ≥ 돌파가 — K암: 시가+전일(고−저)×0.7 / 전일고가암: 전일 고가 (병행)
   - **페이스 게이트**: `pace_ratio = (당일 누적 거래대금 ÷ f(t)) ÷ 5일평균 거래대금 ≥ 3.0`

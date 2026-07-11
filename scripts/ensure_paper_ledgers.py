@@ -7,11 +7,9 @@ from pathlib import Path
 from config.settings import settings
 from core.pace_collectors import (
     LEDGER_DESC_ROW,
-    LEDGER_FIELDS,
     PaperLedger,
-    OD_LEDGER_DESC_ROW,
-    OD_LEDGER_FIELDS,
     OpeningDriveLedger,
+    ThemeMapLedger,
 )
 
 
@@ -35,22 +33,22 @@ def main() -> None:
     k_path = log_dir / "paper_ledger.csv"
     ph_path = log_dir / "paper_ledger_prev_high.csv"
     od_path = log_dir / "paper_ledger_opening_drive.csv"
+    th_path = log_dir / "paper_ledger_theme_map.csv"
 
-    # Ensure K ledger keeps schema (already exists with trades).
     PaperLedger(path=k_path, settings=settings, desc_row=_desc_for_mode("k_range"))
     PaperLedger(path=ph_path, settings=settings, desc_row=_desc_for_mode("prev_high"))
     OpeningDriveLedger(path=od_path, settings=settings)
+    ThemeMapLedger(path=th_path, settings=settings)
 
-    for p in (k_path, ph_path, od_path):
+    for p in (k_path, ph_path, od_path, th_path):
         raw = p.read_bytes()
         has_bom = raw[:3] == b"\xef\xbb\xbf"
         text = raw.decode("utf-8-sig")
         lines = text.splitlines()
         print(f"=== {p.name} ===")
-        print(f"bom={has_bom} size={p.stat().st_size}")
+        print(f"bom={has_bom} size={p.stat().st_size} path={p}")
         for i, line in enumerate(lines[:3]):
-            print(f"L{i+1}: {line[:120]}")
-        # Korean sanity: description row must contain Hangul
+            print(f"L{i+1}: {line[:140]}")
         if len(lines) >= 2 and any("\uac00" <= ch <= "\ud7a3" for ch in lines[1]):
             print("korean_ok=True")
         else:

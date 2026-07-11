@@ -70,6 +70,11 @@
 - ETF 브랜드 제외 폐지. 네이버 시총 상위 10%+MA5로 ETF 편입. ETN/리츠/스팩/인프라/펀드만 이름 제외.
 - `메리츠` 안의 `리츠` 부분문자열 오탐 수정. universe cache_version=4.
 
+최근 작업(2026-07-11) — 4전략 병행 페이퍼(테마맵 추가):
+- `paper_ledger_theme_map.csv` 독립 뱅크롤. `ENABLE_THEME_MAP`.
+- 매주 금 장후 `python -m scripts.update_theme_map` → `config/theme_map.csv` (네이버 테마, 12종 초과 eligible=0).
+- 장중: 핫테마(+2% 비중≥50%) → 후발(중앙값 미만) 당일고점 돌파 + pace≥1.5 → 손절/트레일 -2% / 14:50 청산.
+
 최근 작업(2026-07-11) — 3전략 병행 페이퍼:
 - `paper_ledger.csv`(K=0.7) + `paper_ledger_prev_high.csv`(전일고가) + `paper_ledger_opening_drive.csv` 각각 독립 뱅크롤/원장.
 - `main.py` 1회 실행으로 K·전일고가·Opening Drive 동시 감시(페이퍼). ENABLE_* 플래그로 on/off.

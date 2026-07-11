@@ -127,6 +127,51 @@ OD_LEDGER_DESC_ROW = {
     "pace_ratio_at_entry": "진입 순간 대금 페이스 비율(활력 필터)",
 }
 
+# Theme map: same-day round trip (separate bankroll).
+THEME_LEDGER_FIELDS = [
+    "date",
+    "theme_id",
+    "theme_name",
+    "symbol",
+    "role",
+    "entry_ts",
+    "entry_price",
+    "trigger_price",
+    "qty",
+    "theme_score_at_entry",
+    "stock_ret_at_entry",
+    "theme_median_ret",
+    "exit_ts",
+    "exit_price",
+    "exit_reason",
+    "pnl_bp",
+    "fees_bp",
+    "net_pnl_bp",
+    "pace_ratio_at_entry",
+]
+
+THEME_LEDGER_DESC_ROW = {
+    "date": "#진입일(YYYYMMDD)",
+    "theme_id": "네이버 테마 번호",
+    "theme_name": "테마명",
+    "symbol": "종목코드",
+    "role": "역할(follower)",
+    "entry_ts": "가상 매수 시각(당일고점 돌파 판정)",
+    "entry_price": "가상 매수가=판정 순간 현재가",
+    "trigger_price": "돌파 직전 당일고점",
+    "qty": "수량=종목당 예산/매수가 내림",
+    "theme_score_at_entry": "진입 시 테마 상승비율(+2% 이상 비중)",
+    "stock_ret_at_entry": "진입 시 종목 당일수익률(전일종가 대비)",
+    "theme_median_ret": "진입 시 테마 중앙 수익률",
+    "exit_ts": "가상 매도 시각",
+    "exit_price": "가상 매도가=청산 판정 순간 현재가",
+    "exit_reason": "청산사유(STOP/TRAIL/TIME/THEME_COLLAPSE/FORCE_CLOSE)",
+    "pnl_bp": "총손익(bp, 비용 차감 전. 100bp=1%)",
+    "fees_bp": "왕복 수수료+거래세(bp)",
+    "net_pnl_bp": "최종 성적=총손익-비용(bp)",
+    "pace_ratio_at_entry": "진입 순간 대금 페이스 비율",
+}
+
 
 def _ensure_header(path: Path, fields: List[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -582,6 +627,149 @@ class OpeningDriveLedger:
             writer.writerow(OD_LEDGER_DESC_ROW)
             for row in rows:
                 writer.writerow({k: row.get(k, "") for k in OD_LEDGER_FIELDS})
+
+
+@dataclass
+class ThemeMapLedger:
+    """Same-day paper ledger for Theme Map (separate bankroll/results)."""
+
+    path: Path
+    settings: Settings
+
+    def __post_init__(self) -> None:
+        _migrate_header_if_needed(self.path, THEME_LEDGER_FIELDS)
+        _ensure_header(self.path, THEME_LEDGER_FIELDS)
+        self._ensure_desc_row()
+        self._ensure_excel_bom()
+
+    @staticmethod
+    def _is_desc_row(row: Dict[str, str]) -> bool:
+        return str(row.get("date", "")).startswith("#")
+
+    def _ensure_desc_row(self) -> None:
+        with self.path.open("r", newline="", encoding=CSV_ENCODING) as fp:
+            rows = list(csv.DictReader(fp))
+        if rows and self._is_desc_row(rows[0]):
+            return
+        data_rows = [r for r in rows if not self._is_desc_row(r)]
+        self._rewrite(data_rows)
+
+    def _ensure_excel_bom(self) -> None:
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return
+        if self.path.read_bytes()[:3] == b"\xef\xbb\xbf":
+            return
+        self._rewrite(self._read_all())
+
+    def append_entry(
+        self,
+        *,
+        ymd: str,
+        theme_id: str,
+        theme_name: str,
+        symbol: str,
+        role: str,
+        entry_ts: str,
+        entry_price: int,
+        trigger_price: int,
+        qty: int,
+        theme_score_at_entry: float,
+        stock_ret_at_entry: float,
+        theme_median_ret: float,
+        pace_ratio_at_entry: float,
+    ) -> None:
+        row = {
+            "date": ymd,
+            "theme_id": theme_id,
+            "theme_name": theme_name,
+            "symbol": symbol,
+            "role": role,
+            "entry_ts": entry_ts,
+            "entry_price": entry_price,
+            "trigger_price": trigger_price,
+            "qty": qty,
+            "theme_score_at_entry": f"{theme_score_at_entry:.4f}",
+            "stock_ret_at_entry": f"{stock_ret_at_entry:.4f}",
+            "theme_median_ret": f"{theme_median_ret:.4f}",
+            "exit_ts": "",
+            "exit_price": "",
+            "exit_reason": "",
+            "pnl_bp": "",
+            "fees_bp": "",
+            "net_pnl_bp": "",
+            "pace_ratio_at_entry": f"{pace_ratio_at_entry:.4f}",
+        }
+        with self.path.open("a", newline="", encoding=CSV_ENCODING) as fp:
+            csv.DictWriter(fp, fieldnames=THEME_LEDGER_FIELDS).writerow(row)
+
+    def symbols_open(self, *, ymd: str) -> List[str]:
+        out: List[str] = []
+        for row in self._read_all():
+            if (
+                str(row.get("date", "")).strip() == ymd
+                and not str(row.get("exit_price", "")).strip()
+            ):
+                sym = str(row.get("symbol", "")).strip()
+                if sym and sym not in out:
+                    out.append(sym)
+        return out
+
+    def fill_exit(
+        self,
+        *,
+        ymd: str,
+        symbol: str,
+        exit_ts: str,
+        exit_price: int,
+        exit_reason: str,
+    ) -> bool:
+        rows = self._read_all()
+        updated = False
+        for row in rows:
+            if (
+                row.get("date") == ymd
+                and row.get("symbol") == symbol
+                and not str(row.get("exit_price", "")).strip()
+            ):
+                entry_price = int(float(row.get("entry_price", 0) or 0))
+                qty = int(float(row.get("qty", 0) or 0))
+                if entry_price <= 0 or qty <= 0 or exit_price <= 0:
+                    continue
+                gross_bp = (exit_price / entry_price - 1.0) * 10000.0
+                fees_bp = self._round_trip_fees_bp(entry_price, exit_price, qty)
+                row["exit_ts"] = exit_ts
+                row["exit_price"] = str(exit_price)
+                row["exit_reason"] = exit_reason
+                row["pnl_bp"] = f"{gross_bp:.2f}"
+                row["fees_bp"] = f"{fees_bp:.2f}"
+                row["net_pnl_bp"] = f"{gross_bp - fees_bp:.2f}"
+                updated = True
+        if updated:
+            self._rewrite(rows)
+        return updated
+
+    def _round_trip_fees_bp(self, entry: int, exit_px: int, qty: int) -> float:
+        buy_amt = entry * qty
+        sell_amt = exit_px * qty
+        fee = buy_amt * self.settings.fee_rate_buy + sell_amt * self.settings.fee_rate_sell
+        tax = sell_amt * self.settings.tax_rate_sell
+        if buy_amt <= 0:
+            return 0.0
+        return (fee + tax) / buy_amt * 10000.0
+
+    def _read_all(self) -> List[Dict[str, str]]:
+        if not self.path.exists():
+            return []
+        with self.path.open("r", newline="", encoding=CSV_ENCODING) as fp:
+            return [r for r in csv.DictReader(fp) if not self._is_desc_row(r)]
+
+    def _rewrite(self, rows: List[Dict[str, str]]) -> None:
+        with self.path.open("w", newline="", encoding=CSV_ENCODING) as fp:
+            writer = csv.DictWriter(fp, fieldnames=THEME_LEDGER_FIELDS)
+            writer.writeheader()
+            writer.writerow(THEME_LEDGER_DESC_ROW)
+            for row in rows:
+                writer.writerow({k: row.get(k, "") for k in THEME_LEDGER_FIELDS})
 
 
 def calc_paper_qty(per_symbol_budget: int, entry_price: int) -> int:

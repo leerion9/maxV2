@@ -17,6 +17,7 @@ from core.pace_collectors import (
     LEDGER_DESC_PREV_HIGH,
     OpeningDriveLedger,
     PaperLedger,
+    ThemeMapLedger,
     ValueProfileLogger,
     calc_paper_qty,
 )
@@ -27,6 +28,7 @@ from core.strategy import (
     VolatilityBreakoutStrategy,
 )
 from core.strategy_books import BreakoutBook
+from core.theme_map import ThemeMapRegistry, ThemeMapStrategy
 from core.trading_day import load_manual_holiday_set, prev_trading_day_ymd, should_run_bot_today_kst
 from core.universe_cache import CachedSymbol, UniverseCache, cache_path, load_cache, save_cache, today_kst_yyyymmdd
 
@@ -97,6 +99,19 @@ class MaxVRunner:
         self.od_per_symbol_budget: int | None = None
         self.od_enabled = bool(settings.enable_opening_drive)
 
+        self.theme_enabled = bool(settings.enable_theme_map)
+        self.theme_registry = ThemeMapRegistry()
+        self.theme_strategy = ThemeMapStrategy(registry=self.theme_registry)
+        self.theme_ledger = ThemeMapLedger(
+            path=settings.pace_log_dir / settings.paper_ledger_theme_name,
+            settings=settings,
+        )
+        self.theme_watch_symbols: list[str] = []
+        self.theme_ordered_symbols_today: set[str] = set()
+        self.theme_buy_orders_today: int = 0
+        self.theme_per_symbol_budget: int | None = None
+        self._theme_force_flat_ymd: str = ""
+
         # Live-mode single-arm counters (paper uses per-book counters).
         self.ordered_symbols_today: set[str] = set()
         self.buy_orders_today: int = 0
@@ -149,6 +164,8 @@ class MaxVRunner:
             arms = [b.name for b in self.breakout_books]
             if self.od_enabled:
                 arms.append("opening_drive")
+            if self.theme_enabled:
+                arms.append("theme_map")
             self.logger.info(
                 "paper_mode=ON: KIS 주문 API 차단, 가상 체결·원장 운용 "
                 f"(paper_capital/전략={settings.paper_capital:,} KRW, arms={arms})"
@@ -223,6 +240,16 @@ class MaxVRunner:
         ):
             self._od_force_flat_open(ymd)
             self._od_force_flat_ymd = ymd
+
+        # Theme map: force-flat remaining opens at theme force-exit time.
+        if (
+            settings.paper_mode
+            and self.theme_enabled
+            and hhmm >= settings.theme_force_exit_hhmm
+            and self._theme_force_flat_ymd != ymd
+        ):
+            self._theme_force_flat_open(ymd)
+            self._theme_force_flat_ymd = ymd
 
         if hhmm >= settings.shutdown_hhmm:
             if self._did_result_csv_ymd != ymd:
@@ -371,6 +398,7 @@ class MaxVRunner:
         self.ordered_symbols_today = set()
         self.buy_orders_today = 0
         self._reset_heartbeat_counters()
+        self._prepare_theme_map()
 
         # Strategy prep: prefer cached/naver features, avoid KIS daily calls when available.
         # (pace-gate redesign: the strategy is price-only; volume screening is
@@ -428,10 +456,77 @@ class MaxVRunner:
         arms = [b.name for b in self.breakout_books] + (
             ["opening_drive"] if self.od_enabled else []
         )
+        if self.theme_enabled:
+            arms.append("theme_map")
         self.logger.info(
             "감시 준비 완료. "
             f"{settings.monitor_start_hhmm}~{settings.monitor_end_hhmm} (KST) 구간에서 감시합니다. "
             f"(poll={settings.poll_interval_sec}s, heartbeat={settings.heartbeat_sec}s, arms={arms})"
+        )
+
+    def _prepare_theme_map(self) -> None:
+        """Load weekly theme CSV and register watch symbols (eligible themes only)."""
+        self.theme_ordered_symbols_today = set()
+        self.theme_buy_orders_today = 0
+        self.theme_watch_symbols = []
+        if not self.theme_enabled:
+            return
+        path = settings.theme_map_path
+        if not path.exists():
+            self.logger.error(
+                f"theme_map CSV 없음: {path} — "
+                "금요일 장후 `python -m scripts.update_theme_map` 실행 필요. theme_map 비활성."
+            )
+            self.theme_enabled = False
+            return
+        self.theme_registry = ThemeMapRegistry.from_csv(
+            path,
+            max_members=settings.theme_max_members,
+            min_members=settings.theme_min_members,
+        )
+        self.theme_strategy = ThemeMapStrategy(
+            registry=self.theme_registry,
+            hot_ret=settings.theme_hot_ret,
+            hot_ratio=settings.theme_hot_ratio,
+            min_members=settings.theme_min_members,
+            entry_start_hhmm=settings.theme_entry_start_hhmm,
+            entry_end_hhmm=settings.theme_entry_end_hhmm,
+            stop_pct=settings.theme_stop_pct,
+            trail_pct=settings.theme_trail_pct,
+            force_exit_hhmm=settings.theme_force_exit_hhmm,
+            min_pace_ratio=settings.theme_min_pace_ratio,
+            max_themes=settings.theme_max_themes,
+        )
+        self.theme_watch_symbols = self.theme_registry.watch_symbols()
+        # Ensure prev_close / value_ma5 for theme-only symbols.
+        for symbol in self.theme_watch_symbols:
+            feat = self.symbol_features.get(symbol)
+            if feat is not None:
+                self.theme_strategy.register(symbol, prev_close=feat.prev_close)
+                continue
+            try:
+                rows = self.api.get_daily_prices(symbol=symbol, days=6)
+                if len(rows) < 2:
+                    continue
+                prev_close = int(rows[0]["close"])
+                value_ma5 = int(sum(r["close"] * r["volume"] for r in rows[:5]) / 5)
+                avg_volume_5d = int(sum(r["volume"] for r in rows[:5]) / 5)
+                self.symbol_features[symbol] = CachedSymbol(
+                    avg_volume_5d=avg_volume_5d,
+                    prev_high=int(rows[0]["high"]),
+                    prev_low=int(rows[0]["low"]),
+                    value_ma5=value_ma5,
+                    prev_close=prev_close,
+                )
+                self.theme_strategy.register(symbol, prev_close=prev_close)
+                time.sleep(0.05)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.error(f"theme prep failed {symbol}: {exc}")
+        n_elig = len(self.theme_registry.eligible_themes())
+        self.logger.info(
+            f"theme_map ready: updated={self.theme_registry.updated_ymd} "
+            f"eligible_themes={n_elig} watch={len(self.theme_watch_symbols)} "
+            f"path={path.name}"
         )
     def liquidate_all_holdings_at_open(self) -> None:
         """
@@ -522,6 +617,8 @@ class MaxVRunner:
         if settings.paper_mode:
             if any(b.budget() <= 0 for b in self.breakout_books) or (
                 self.od_enabled and int(self.od_per_symbol_budget or 0) <= 0
+            ) or (
+                self.theme_enabled and int(self.theme_per_symbol_budget or 0) <= 0
             ):
                 self.logger.error("Per-symbol budget invalid. Keep monitoring only.")
                 return
@@ -541,7 +638,16 @@ class MaxVRunner:
         cycle_signals = 0
         cycle_buys = 0
         cycle_skipped_signals = 0
-        for symbol in self.today_universe:
+
+        poll_symbols = list(self.today_universe)
+        if self.theme_enabled and self.theme_watch_symbols:
+            seen = set(poll_symbols)
+            for sym in self.theme_watch_symbols:
+                if sym not in seen:
+                    poll_symbols.append(sym)
+                    seen.add(sym)
+
+        for symbol in poll_symbols:
             cycle_scanned += 1
             try:
                 quote = self.api.get_quote(symbol)
@@ -554,7 +660,7 @@ class MaxVRunner:
             quote_dt = self._now_kst_local()
             quote_hhmm = quote_dt.strftime("%H:%M")
             feat = self.symbol_features.get(symbol)
-            if snapshot_profile and feat is not None:
+            if snapshot_profile and feat is not None and symbol in self.today_universe:
                 profile_rows.append(
                     {
                         "ts": quote_dt.isoformat(timespec="seconds"),
@@ -566,7 +672,33 @@ class MaxVRunner:
                     }
                 )
 
+            # --- Theme map (paper only; same-day) ---
+            if settings.paper_mode and self.theme_enabled and feat is not None:
+                th_entry, th_exit = self.theme_strategy.on_quote(
+                    quote, now_hhmm=quote_hhmm, value_ma5=feat.value_ma5
+                )
+                if th_exit is not None:
+                    self._theme_paper_exit(
+                        ymd=ymd,
+                        symbol=symbol,
+                        exit_price=th_exit.exit_price,
+                        exit_reason=th_exit.reason,
+                        exit_ts=quote_dt.isoformat(timespec="seconds"),
+                    )
+                elif th_entry is not None:
+                    entered_th = self._theme_paper_buy(
+                        ymd=ymd,
+                        symbol=symbol,
+                        entry=th_entry,
+                        entry_ts=quote_dt.isoformat(timespec="seconds"),
+                    )
+                    if entered_th:
+                        cycle_signals += 1
+                        cycle_buys += 1
+
             if feat is None:
+                continue
+            if symbol not in self.today_universe:
                 continue
 
             # --- Opening Drive (paper only; same-day) ---
@@ -708,10 +840,15 @@ class MaxVRunner:
         )
         if self.od_enabled:
             book_status += f",od:{self.od_buy_orders_today}/{settings.od_max_positions}"
+        if self.theme_enabled:
+            book_status += (
+                f",theme:{self.theme_buy_orders_today}/{settings.theme_max_positions}"
+            )
         emitted = self._maybe_heartbeat(
             "monitoring",
             "감시중... "
             f"now={now_kst} KST watchlist={len(self.today_universe)} "
+            f"theme_watch={len(self.theme_watch_symbols)} "
             f"arms=[{book_status}] "
             f"paper={'Y' if settings.paper_mode else 'N'} "
             f"(cycles={self._hb_cycles}, quote_err={self._hb_quote_err}, "
@@ -919,6 +1056,100 @@ class MaxVRunner:
             )
             time.sleep(0.15)
 
+    def _theme_paper_buy(self, *, ymd: str, symbol: str, entry, entry_ts: str) -> bool:
+        if symbol in self.theme_ordered_symbols_today:
+            return False
+        if self.theme_buy_orders_today >= settings.theme_max_positions:
+            return False
+        budget = int(self.theme_per_symbol_budget or 0)
+        qty = calc_paper_qty(budget, entry.entry_price)
+        if qty <= 0:
+            self.logger.error(
+                f"THEME PAPER BUY qty=0 {symbol} entry={entry.entry_price}"
+            )
+            return False
+        self.theme_ledger.append_entry(
+            ymd=ymd,
+            theme_id=str(entry.theme_id),
+            theme_name=str(entry.theme_name),
+            symbol=symbol,
+            role=str(entry.role),
+            entry_ts=entry_ts,
+            entry_price=int(entry.entry_price),
+            trigger_price=int(entry.trigger_price),
+            qty=qty,
+            theme_score_at_entry=float(entry.theme_score),
+            stock_ret_at_entry=float(entry.stock_ret),
+            theme_median_ret=float(entry.theme_median_ret),
+            pace_ratio_at_entry=float(entry.pace_ratio),
+        )
+        self.theme_strategy.confirm_entry(symbol, entry.entry_price)
+        self.theme_ordered_symbols_today.add(symbol)
+        self.theme_buy_orders_today += 1
+        self.logger.log_signal(
+            {
+                "symbol": symbol,
+                "breakout_price": entry.trigger_price,
+                "reason": f"theme_map:{entry.theme_id}",
+                "action": "PAPER_BUY",
+                "note": (
+                    f"score={entry.theme_score:.2f} stock_ret={entry.stock_ret:.3f} "
+                    f"median={entry.theme_median_ret:.3f}"
+                ),
+            }
+        )
+        self.logger.info(
+            f"[페이퍼매수/theme_map] {symbol} theme={entry.theme_id}:{entry.theme_name} "
+            f"entry={entry.entry_price} trigger={entry.trigger_price} qty={qty} "
+            f"score={entry.theme_score:.2f} pace={entry.pace_ratio:.2f}"
+        )
+        return True
+
+    def _theme_paper_exit(
+        self,
+        *,
+        ymd: str,
+        symbol: str,
+        exit_price: int,
+        exit_reason: str,
+        exit_ts: str,
+    ) -> None:
+        ok = self.theme_ledger.fill_exit(
+            ymd=ymd,
+            symbol=symbol,
+            exit_ts=exit_ts,
+            exit_price=exit_price,
+            exit_reason=exit_reason,
+        )
+        if ok:
+            self.theme_strategy.mark_exited(symbol)
+            self.logger.info(
+                f"[페이퍼매도/theme_map] {symbol} exit={exit_price} reason={exit_reason}"
+            )
+
+    def _theme_force_flat_open(self, ymd: str) -> None:
+        open_syms = self.theme_ledger.symbols_open(ymd=ymd)
+        if not open_syms:
+            return
+        exit_ts = self._now_kst_local().isoformat(timespec="seconds")
+        for symbol in open_syms:
+            try:
+                quote = self.api.get_quote(symbol)
+                px = int(quote.current_price or 0)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.error(f"theme force-flat quote failed {symbol}: {exc}")
+                continue
+            if px <= 0:
+                continue
+            self._theme_paper_exit(
+                ymd=ymd,
+                symbol=symbol,
+                exit_price=px,
+                exit_reason="FORCE_CLOSE",
+                exit_ts=exit_ts,
+            )
+            time.sleep(0.15)
+
     def _fill_paper_open_exits(self, ymd: str) -> bool:
         """
         당일 시가로 이전 세션 진입분의 exit_open_next를 소급 기입한다.
@@ -1073,13 +1304,18 @@ class MaxVRunner:
             for book in self.breakout_books:
                 book.per_symbol_budget = int(capital // int(book.max_positions))
             self.od_per_symbol_budget = int(capital // int(settings.od_max_positions))
+            self.theme_per_symbol_budget = int(
+                capital // int(settings.theme_max_positions)
+            )
             self.per_symbol_budget = per
             self.cash_snapshot_done = True
             self.logger.info(
                 "페이퍼 예산 스냅샷 완료(전략별 독립). "
                 f"paper_capital/전략={capital} "
                 f"breakout_budget={per} od_budget={self.od_per_symbol_budget} "
-                f"orders_cap={settings.max_positions}/{settings.od_max_positions}"
+                f"theme_budget={self.theme_per_symbol_budget} "
+                f"orders_cap={settings.max_positions}/{settings.od_max_positions}/"
+                f"{settings.theme_max_positions}"
             )
             return True
 
