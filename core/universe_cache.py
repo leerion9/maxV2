@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Dict, Optional
 from zoneinfo import ZoneInfo
 
+# v4 (2026-07-11): ETF 재편입(시총 상위 10%+MA5). ETN/리츠/스팩/인프라만 이름 제외.
 # v3 (2026-07-08): ETF/ETN/펀드/스팩/리츠/인프라 제외 필터 도입 — 필터 이전 캐시 무효화.
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 
 
 @dataclass(frozen=True)

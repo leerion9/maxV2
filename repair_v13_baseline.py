@@ -16,7 +16,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+from pathlib import Path
 
 import pandas as pd
 from tqdm import tqdm
@@ -24,6 +26,8 @@ from tqdm import tqdm
 import repair_v13_bankroll as rv
 
 DATA_DIR = "data/raw"
+ARCHIVE_BASE = Path(r"c:\cursor\00_archive\data\naver_daily_archive")
+MCAP_EDGE_SKIP = {"301410", "422260", "461270", "550043"}
 WARMUP_DAYS = 15
 
 COL_MAP = {
@@ -89,6 +93,71 @@ def _load_frame(
         return None
 
 
+def _load_archive_frame(
+    symbol: str,
+    merged_dir: Path,
+    features_dir: Path,
+    load_from: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> tuple[str, pd.DataFrame] | None:
+    merged_path = merged_dir / f"{symbol}.json"
+    feat_path = features_dir / f"{symbol}.parquet"
+    if not merged_path.exists() or not feat_path.exists():
+        return None
+
+    payload = json.loads(merged_path.read_text(encoding="utf-8"))
+    bars = payload.get("bars") or []
+    if not bars:
+        return None
+
+    ohlcv = pd.DataFrame(bars)
+    ohlcv = ohlcv.rename(
+        columns={
+            "date": "Date",
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }
+    )
+    ohlcv["Date"] = pd.to_datetime(ohlcv["Date"], format="%Y%m%d")
+    for c in ("Open", "High", "Low", "Close", "Volume"):
+        ohlcv[c] = pd.to_numeric(ohlcv[c], errors="coerce")
+
+    feat = pd.read_parquet(feat_path)
+    if feat.index.name == "date":
+        feat = feat.reset_index()
+    feat["Date"] = pd.to_datetime(feat["date"].astype(str), format="%Y%m%d")
+    feat = feat.drop(columns=["date"], errors="ignore")
+
+    df = ohlcv.merge(feat, on="Date", how="inner")
+    df = df[(df["Date"] >= load_from) & (df["Date"] <= end_ts)]
+    if len(df) < 10:
+        return None
+
+    if "trading_value" in df.columns:
+        df["Value"] = pd.to_numeric(df["trading_value"], errors="coerce")
+    else:
+        df["Value"] = df["Close"] * df["Volume"]
+    if "value_ma5" in df.columns:
+        df["Value_MA5"] = pd.to_numeric(df["value_ma5"], errors="coerce")
+    if "market_cap" in df.columns:
+        df["MarketCap"] = pd.to_numeric(df["market_cap"], errors="coerce")
+    elif "MarketCap" not in df.columns:
+        return None
+
+    keep = ["Date", "Open", "High", "Low", "Close", "Volume", "MarketCap", "Value", "Value_MA5"]
+    if "market" in df.columns:
+        keep.append("market")
+    if "close_ma5" in df.columns:
+        df["MA5_feat"] = pd.to_numeric(df["close_ma5"], errors="coerce")
+        keep.append("MA5_feat")
+
+    out = df[keep].sort_values("Date").reset_index(drop=True)
+    return symbol, out
+
+
 def _build_daily_cutoffs(
     frames: dict[str, pd.DataFrame],
     ratio: float,
@@ -104,7 +173,9 @@ def _build_daily_cutoffs(
     반환: DataFrame(index=Date), 컬럼 mcap_cut_lo(포함 하한), mcap_cut_hi(제외 상한, 밴드 아닐 땐 NaN).
     """
     chunks = []
-    for df in frames.values():
+    for ticker, df in frames.items():
+        if ticker in MCAP_EDGE_SKIP:
+            continue
         sub = df[["Date", "MarketCap"]].dropna(subset=["MarketCap"])
         if not sub.empty:
             chunks.append(sub)
@@ -147,13 +218,22 @@ def _extract_signals_pit(
     require_target_in_range: bool = False,
     require_prev_high_in_range: bool = False,
     mcap_side: str = "top",
+    value_ma5_min: float | None = None,
+    instrument_filter: str = "all",
+    target_mode: str = "k_breakout",
+    use_mcap: bool = True,
 ) -> list[dict]:
     df = df.copy()
     df["range"] = df["High"].shift(1) - df["Low"].shift(1)
-    df["target"] = df["Open"] + df["range"] * K
+    if target_mode == "prev_high":
+        df["target"] = df["High"].shift(1)
+    else:
+        df["target"] = df["Open"] + df["range"] * K
 
-    df["Value"] = df["Close"] * df["Volume"]
-    df["Value_MA5"] = df["Value"].rolling(window=5).mean()
+    if "Value" not in df.columns:
+        df["Value"] = df["Close"] * df["Volume"]
+    if "Value_MA5" not in df.columns:
+        df["Value_MA5"] = df["Value"].rolling(window=5).mean()
     if not use_volume:
         # 거래대금 필터 제거 (A2)
         df["vol_spike"] = True
@@ -169,7 +249,7 @@ def _extract_signals_pit(
             spike = spike.shift(vol_lag).eq(True)
         df["vol_spike"] = spike
 
-    df["MA5"] = df["Close"].rolling(window=5).mean()
+    df["MA5"] = df["MA5_feat"] if "MA5_feat" in df.columns else df["Close"].rolling(window=5).mean()
     df["market_ok"] = df["Close"].shift(1) > df["MA5"].shift(1)
 
     df = df.merge(cutoffs.reset_index(), on="Date", how="left")
@@ -186,7 +266,10 @@ def _extract_signals_pit(
     else:
         mcap_ok_raw = df["MarketCap"].notna() & (df["MarketCap"] >= df["mcap_cut_lo"])
     # shift 시 NaN → object dtype 방지: bool 비교로 직접 캐스팅 (전날 기준 = D-1 자격)
-    df["mcap_ok"] = mcap_ok_raw.shift(mcap_lag).eq(True)
+    if use_mcap:
+        df["mcap_ok"] = mcap_ok_raw.shift(mcap_lag).eq(True)
+    else:
+        df["mcap_ok"] = True
 
     cond = df["mcap_ok"] & df["vol_spike"]
     if require_breakout:
@@ -198,6 +281,12 @@ def _extract_signals_pit(
         cond = cond & (df["Low"] < prev_high) & (prev_high < df["High"])
     if use_ma5:
         cond = cond & df["market_ok"]
+    if value_ma5_min is not None:
+        cond = cond & (df["Value_MA5"].shift(1) >= value_ma5_min)
+    if instrument_filter == "exclude_etf" and "market" in df.columns:
+        cond = cond & (df["market"] != "etf외")
+    elif instrument_filter == "etf_only" and "market" in df.columns:
+        cond = cond & (df["market"] == "etf외")
     df["is_buy"] = cond
 
     in_period = (df["Date"] >= start_ts) & (df["Date"] <= end_ts)
@@ -324,23 +413,37 @@ def load_frames(
     start: str = "2020-01-01",
     end: str = "2026-05-31",
     data_dir: str = DATA_DIR,
+    archive_base: Path | None = None,
     verbose: bool = True,
 ) -> dict[str, pd.DataFrame]:
-    """raw CSV 를 한 번만 로드해 프레임 dict 반환 (여러 세트 실행 시 재사용)."""
+    """raw CSV 또는 00_archive merged+features 를 한 번만 로드."""
     start_ts = pd.Timestamp(start)
     end_ts = pd.Timestamp(end)
     load_from = start_ts - pd.Timedelta(days=WARMUP_DAYS + 14)
 
-    file_list = [f for f in os.listdir(data_dir) if f.endswith(".csv")]
-    if verbose:
-        print(f"📌 raw 파일 로드: {len(file_list)}")
-
     frames: dict[str, pd.DataFrame] = {}
-    iterator = tqdm(file_list, desc="load") if verbose else file_list
-    for filename in iterator:
-        loaded = _load_frame(filename, data_dir, load_from, end_ts)
-        if loaded is not None:
-            frames[loaded[0]] = loaded[1]
+    if archive_base is not None:
+        merged_dir = archive_base / "merged"
+        features_dir = archive_base / "features"
+        symbols = sorted(p.stem for p in merged_dir.glob("*.json"))
+        if verbose:
+            print(f"📌 archive 로드: {archive_base} ({len(symbols)}종)")
+        iterator = tqdm(symbols, desc="load") if verbose else symbols
+        for symbol in iterator:
+            if symbol in MCAP_EDGE_SKIP:
+                continue
+            loaded = _load_archive_frame(symbol, merged_dir, features_dir, load_from, end_ts)
+            if loaded is not None:
+                frames[loaded[0]] = loaded[1]
+    else:
+        file_list = [f for f in os.listdir(data_dir) if f.endswith(".csv")]
+        if verbose:
+            print(f"📌 raw 파일 로드: {len(file_list)}")
+        iterator = tqdm(file_list, desc="load") if verbose else file_list
+        for filename in iterator:
+            loaded = _load_frame(filename, data_dir, load_from, end_ts)
+            if loaded is not None:
+                frames[loaded[0]] = loaded[1]
 
     if verbose:
         print(f"로드 완료: {len(frames)}종")
@@ -367,12 +470,17 @@ def run_baseline(
     require_target_in_range: bool = False,
     require_prev_high_in_range: bool = False,
     mcap_side: str = "top",
+    value_ma5_min: float | None = None,
+    instrument_filter: str = "all",
+    target_mode: str = "k_breakout",
+    use_mcap: bool = True,
     seed: int = rv.RANDOM_SEED,
     cost_mult: float = rv.COST_MULT,
     initial_bankroll: float = rv.INITIAL_BANKROLL,
     max_daily_positions: int = rv.MAX_DAILY_POSITIONS,
     budget: float = rv.BUDGET,
     frames: dict[str, pd.DataFrame] | None = None,
+    archive_base: Path | None = None,
     verbose: bool = True,
 ) -> dict:
     start_ts = pd.Timestamp(start)
@@ -384,8 +492,12 @@ def run_baseline(
         mcap_label = f"상위 {mcap_ratio*100:.0f}%~{mcap_ratio_hi*100:.0f}%"
     else:
         mcap_label = f"상위 {mcap_ratio*100:.0f}%"
-    buy_label = "당일 종가" if buy_price_mode == "close" else "돌파가(target)"
-    breakout_label = "적용" if require_breakout else "미적용"
+    if target_mode == "prev_high":
+        buy_label = "전일 고가"
+        breakout_label = "당일 고가 ≥ 전일 고가"
+    else:
+        buy_label = "당일 종가" if buy_price_mode == "close" else "돌파가(target)"
+        breakout_label = "적용" if require_breakout else "미적용"
     if require_target_in_range:
         breakout_label += " + 저가<기준가<고가"
     if require_prev_high_in_range:
@@ -397,15 +509,26 @@ def run_baseline(
         vol_label = f"{'전일' if vol_lag else '당일'} 거래대금 {vol_mult*100:.0f}%~{vol_mult_hi*100:.0f}%"
     else:
         vol_label = f"{'전일' if vol_lag else '당일'} 거래대금 ≥ {vol_mult*100:.0f}%"
+    liq_label = "미적용"
+    if value_ma5_min is not None:
+        liq_label = f"전일 5일평균 거래대금 ≥ {value_ma5_min/1e8:.0f}억원"
+    inst_label = {"all": "전체", "exclude_etf": "ETF 제외", "etf_only": "ETF만"}.get(
+        instrument_filter, instrument_filter
+    )
 
+    mcap_verbose = mcap_label if use_mcap else "미적용"
     if verbose:
         print(f"🚀 repair_v13 baseline (point-in-time 시총) ({start} ~ {end})")
         print(f"📌 조건: K={K}, 돌파조건 {breakout_label}, 매수체결 {buy_label}, {vol_label}, MA5={use_ma5}, "
-              f"매매 전날 기준 시총 {mcap_label}, 매도 {sell_label}, 비용 {(1-cost_mult)*100:.0f}%")
+              f"매매 전날 기준 시총 {mcap_verbose}, 유동성 {liq_label}, 종목 {inst_label}, "
+              f"매도 {sell_label}, 비용 {(1-cost_mult)*100:.0f}%")
         print(f"📌 뱅크롤 {initial_bankroll:,.0f}원 · 슬롯 ÷{max_daily_positions} · 일 {max_daily_positions}종")
 
     if frames is None:
-        frames = load_frames(start=start, end=end, data_dir=data_dir, verbose=verbose)
+        frames = load_frames(
+            start=start, end=end, data_dir=data_dir,
+            archive_base=archive_base, verbose=verbose,
+        )
 
     cutoffs = _build_daily_cutoffs(
         frames, mcap_ratio, ratio_hi=mcap_ratio_hi, side=mcap_side,
@@ -419,6 +542,8 @@ def run_baseline(
     calendar: set[pd.Timestamp] = set()
     iterator = tqdm(frames.items(), desc="signal") if verbose else frames.items()
     for ticker, df in iterator:
+        if ticker in MCAP_EDGE_SKIP:
+            continue
         in_period = (df["Date"] >= start_ts) & (df["Date"] <= end_ts)
         calendar.update(df.loc[in_period, "Date"])
         all_signals.extend(
@@ -431,6 +556,10 @@ def run_baseline(
                 require_target_in_range=require_target_in_range,
                 require_prev_high_in_range=require_prev_high_in_range,
                 mcap_side=mcap_side,
+                value_ma5_min=value_ma5_min,
+                instrument_filter=instrument_filter,
+                target_mode=target_mode,
+                use_mcap=use_mcap,
             )
         )
 
@@ -484,6 +613,11 @@ def run_baseline(
             "require_target_in_range": require_target_in_range,
             "require_prev_high_in_range": require_prev_high_in_range,
             "mcap_side": mcap_side,
+            "value_ma5_min": value_ma5_min,
+            "instrument_filter": instrument_filter,
+            "target_mode": target_mode,
+            "use_mcap": use_mcap,
+            "data_source": "archive" if archive_base is not None else "raw",
         },
     )
 

@@ -45,6 +45,8 @@ from build_backtest_ppt import (
     _title,
     _buy_base_label,
     _breakout_label,
+    _instrument_label,
+    _liquidity_label,
     _vol_label,
     add_detail_slides,
     make_charts,
@@ -55,6 +57,11 @@ plt.rcParams["axes.unicode_minus"] = False
 
 # --- 공통(기준) 실행 설정 ---
 COMMON = dict(start="2020-01-01", end="2026-05-31", data_dir="data/raw")
+COMMON_ARCHIVE = dict(
+    start="2020-01-01",
+    end="2026-05-31",
+    archive_base=bl.ARCHIVE_BASE,
+)
 
 # --- 프리셋: 세트 목록 · PPT 파일명 · 표지 부제 ---
 PRESETS: dict[str, dict] = {
@@ -339,6 +346,85 @@ PRESETS: dict[str, dict] = {
         "subtitle": "기준 · 전일고가 구간(저가<전일고<당일고)+거래대금제거 비교 · 뱅크롤 1억 복리",
         "chart_tag": "prev_high_range",
     },
+    "liquidity_etf": {
+        "common": COMMON_ARCHIVE,
+        "sets": [
+            {
+                "key": "base",
+                "name": "기준 (baseline)",
+                "short": "기준\n300%",
+                "sub": "K=0.7 · 시총 상위10% · MA5 · 당일 거래대금 300% · 익일 시가 · 비용 1%",
+                "over": {},
+            },
+            {
+                "key": "liq50",
+                "name": "세트2 · 5일평균≥50억",
+                "short": "50억\n추가",
+                "sub": "매수 후보: 전일 5일평균 거래대금 ≥ 50억원 추가 (나머지 기준 동일)",
+                "over": {"value_ma5_min": 5_000_000_000},
+            },
+            {
+                "key": "liq50_no_etf",
+                "name": "세트3 · ETF제외+50억",
+                "short": "ETF제외\n50억",
+                "sub": "ETF·ETN 제외 + 전일 5일평균 거래대금 ≥ 50억원 (나머지 기준 동일)",
+                "over": {
+                    "value_ma5_min": 5_000_000_000,
+                    "instrument_filter": "exclude_etf",
+                },
+            },
+            {
+                "key": "etf_only",
+                "name": "세트4 · ETF만+50억+0.5%",
+                "short": "ETF만\n0.5%",
+                "sub": "ETF·ETN만 + 5일평균≥50억 + 비용 0.5% (나머지 기준 동일)",
+                "over": {
+                    "value_ma5_min": 5_000_000_000,
+                    "instrument_filter": "etf_only",
+                    "cost_mult": 0.995,
+                },
+            },
+        ],
+        "out": "repair_v13_liquidity_etf_sets_compare.pptx",
+        "subtitle": "기준 · 5일평균≥50억 · ETF제외+50억 · ETF만+50억+0.5% 비교 · 00_archive · 뱅크롤 1억 복리",
+        "chart_tag": "liquidity_etf",
+    },
+    "prev_high_buy": {
+        "common": COMMON_ARCHIVE,
+        "sets": [
+            {
+                "key": "base",
+                "name": "세트1 · 기준 (baseline)",
+                "short": "기준\nK0.7",
+                "sub": "K=0.7 돌파가 · 시총 상위10% · MA5 · 당일 거래대금 300% · 익일 시가 · 비용 1%",
+                "over": {},
+            },
+            {
+                "key": "prev_high",
+                "name": "세트2 · 전일고가 매수",
+                "short": "전일고가\n+거래대금",
+                "sub": "매수 기준가·체결가 = 전일 고가 (고가≥전일고가) · 거래대금 300% 유지 (나머지 기준 동일)",
+                "over": {"target_mode": "prev_high"},
+            },
+            {
+                "key": "prev_high_no_vol",
+                "name": "세트3 · 전일고가 + 거래대금 제거",
+                "short": "전일고가\n거래대금X",
+                "sub": "전일 고가 매수 · 거래대금 필터 제거 (나머지 기준 동일)",
+                "over": {"target_mode": "prev_high", "use_volume": False},
+            },
+            {
+                "key": "no_mcap",
+                "name": "세트4 · 시총 상위10% 제거",
+                "short": "시총\n필터X",
+                "sub": "시총 상위 10% 필터 제거 (K=0.7·거래대금 300% 등 나머지 기준 동일)",
+                "over": {"use_mcap": False},
+            },
+        ],
+        "out": "repair_v13_prev_high_buy_sets_compare.pptx",
+        "subtitle": "기준 · 전일고가 매수 · 전일고가+거래대금X · 시총필터X 비교 · 00_archive · 뱅크롤 1억 복리",
+        "chart_tag": "prev_high_buy",
+    },
 }
 
 
@@ -436,7 +522,7 @@ def add_cover(prs: Presentation, period_line: str, subtitle: str) -> None:
          period_line, 15, color=RGBColor(0x9A, 0xA6, 0xC0))
 
 
-def add_summary_table(prs: Presentation, results: list[dict]) -> None:
+def add_summary_table(prs: Presentation, results: list[dict], *, common: dict) -> None:
     s = _blank(prs)
     _bg(s, WHITE)
     _title(s, "세트별 비교 요약")
@@ -454,6 +540,8 @@ def add_summary_table(prs: Presentation, results: list[dict]) -> None:
         row("시장 필터", lambda x: "전일 종가 > MA5" if x["params"].get("use_ma5_filter", True) else "미적용"),
         row("시총 필터", lambda x: f"{_mcap_span(x['params'])} (D-1 cross-section)"),
         row("거래대금 조건", lambda x: _vol_label(x["params"])),
+        row("유동성 하한", lambda x: _liquidity_label(x["params"])),
+        row("종목 유형", lambda x: _instrument_label(x["params"])),
         row("거래비용", lambda x: _cost_pct(x["params"])),
         row("고정 매매건수", lambda x: f"{x['fixed']['trades']:,}건"),
         row("총 매매일수", lambda x: f"{x['fixed']['trade_days']:,}일"),
@@ -486,7 +574,7 @@ def add_summary_table(prs: Presentation, results: list[dict]) -> None:
     )
     eff = results[0]["res"]["params"].get("effective_end")
     _box(s, Inches(0.5), Inches(7.0), Inches(12.4), Inches(0.4),
-         f"※ 기간 {COMMON['start']} ~ {COMMON['end']} (실제 데이터 종료 {eff}) · 각 세트는 기준 조건에서 해당 항목만 변경",
+         f"※ 기간 {common['start']} ~ {common['end']} (실제 데이터 종료 {eff}) · 각 세트는 기준 조건에서 해당 항목만 변경",
          11, color=RGBColor(0x60, 0x66, 0x72))
 
 
@@ -559,6 +647,7 @@ def build_sets_report(
     *,
     subtitle: str,
     chart_tag: str,
+    common: dict,
     range_stats: dict[str, int] | None = None,
 ) -> Path:
     prs = Presentation()
@@ -566,13 +655,13 @@ def build_sets_report(
     prs.slide_height = SLIDE_H
 
     eff = results[0]["res"]["params"].get("effective_end")
-    period_line = f"기간  {COMMON['start']} ~ {COMMON['end']}  (실제 데이터 종료: {eff})"
+    period_line = f"기간  {common['start']} ~ {common['end']}  (실제 데이터 종료: {eff})"
 
     print("▶ 비교 차트 생성...")
     cmp_chart = make_compare_chart(results, chart_tag=chart_tag)
 
     add_cover(prs, period_line, subtitle)
-    add_summary_table(prs, results)
+    add_summary_table(prs, results, common=common)
     add_compare_chart_slide(prs, cmp_chart)
     if range_stats is not None:
         add_range_rejection_slide(prs, range_stats)
@@ -608,13 +697,14 @@ def main() -> None:
     args = ap.parse_args()
     cfg = PRESETS[args.preset]
     sets = cfg["sets"]
+    common = cfg.get("common", COMMON)
 
     print(f"▶ 조건 세트 배치 백테스트 시작 (preset={args.preset})")
-    frames = bl.load_frames(**COMMON, verbose=True)
+    frames = bl.load_frames(**common, verbose=True)
     results: list[dict] = []
     for spec in sets:
         print(f"\n▶ [{spec['name']}] 백테스트 실행...")
-        res = bl.run_baseline(**COMMON, frames=frames, verbose=False, **spec["over"])
+        res = bl.run_baseline(**common, frames=frames, verbose=False, **spec["over"])
         if not res:
             print(f"❌ [{spec['name']}] 결과 없음 — 건너뜀")
             continue
@@ -631,8 +721,8 @@ def main() -> None:
 
     range_stats = None
     if cfg.get("range_analysis"):
-        start_ts = pd.Timestamp(COMMON["start"])
-        end_ts = pd.Timestamp(COMMON["end"])
+        start_ts = pd.Timestamp(common["start"])
+        end_ts = pd.Timestamp(common["end"])
         cutoffs = bl._build_daily_cutoffs(frames, 0.1, ratio_hi=None, side="top")
         range_stats = bl.count_all_breakout_rejected_not_above_low(
             frames, cutoffs, start_ts, end_ts,
@@ -649,6 +739,7 @@ def main() -> None:
         cfg["out"],
         subtitle=cfg["subtitle"],
         chart_tag=cfg["chart_tag"],
+        common=common,
         range_stats=range_stats,
     )
 

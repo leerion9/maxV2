@@ -11,6 +11,10 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT_DIR / ".env")
 
 
+def _env_bool(name: str, default: str = "true") -> bool:
+    return os.getenv(name, default).lower() == "true"
+
+
 @dataclass(frozen=True)
 class Settings:
     app_key: str = os.getenv("APP_KEY", "")
@@ -31,8 +35,14 @@ class Settings:
     allocation_per_symbol: float = 1.0 / 5
     breakout_k: float = 0.7
 
+    # Parallel paper strategies (each has its own bankroll + ledger).
+    enable_k_range: bool = _env_bool("ENABLE_K_RANGE", "true")
+    enable_prev_high: bool = _env_bool("ENABLE_PREV_HIGH", "true")
+    enable_opening_drive: bool = _env_bool("ENABLE_OPENING_DRIVE", "true")
+
     # Pace gate + paper observation mode (WORK_ORDER pace_gate)
     paper_mode: bool = os.getenv("PAPER_MODE", "true").lower() == "true"
+    # Per-strategy paper capital (K / prev_high / OD each get this amount).
     paper_capital: int = int(os.getenv("PAPER_CAPITAL", "10000000") or "10000000")
     pace_threshold: float = float(os.getenv("PACE_THRESHOLD", "3.0") or "3.0")
     pace_entry_start_hhmm: str = os.getenv("PACE_ENTRY_START_HHMM", "09:10")
@@ -47,6 +57,20 @@ class Settings:
         "PAPER_OPEN_EXIT_FILL_DEADLINE_HHMM", "09:30"
     )
     pace_log_dir: Path = ROOT_DIR / "logs"
+    paper_ledger_k_name: str = "paper_ledger.csv"
+    paper_ledger_prev_high_name: str = "paper_ledger_prev_high.csv"
+    paper_ledger_od_name: str = "paper_ledger_opening_drive.csv"
+
+    # Opening Drive (fixed mock set from HANDOFF)
+    od_gap_min: float = float(os.getenv("OD_GAP_MIN", "0.015") or "0.015")
+    od_gap_max: float = float(os.getenv("OD_GAP_MAX", "0.03") or "0.03")
+    od_observe_end_hhmm: str = os.getenv("OD_OBSERVE_END_HHMM", "09:30")
+    od_stop_pct: float = float(os.getenv("OD_STOP_PCT", "0.02") or "0.02")
+    od_trail_pct: float = float(os.getenv("OD_TRAIL_PCT", "0.02") or "0.02")
+    od_force_exit_hhmm: str = os.getenv("OD_FORCE_EXIT_HHMM", "11:00")
+    od_min_pace_ratio: float = float(os.getenv("OD_MIN_PACE_RATIO", "1.5") or "1.5")
+    od_max_positions: int = int(os.getenv("OD_MAX_POSITIONS", "5") or "5")
+
     monitor_start_hhmm: str = "09:00"
     monitor_end_hhmm: str = "15:30"
     shutdown_hhmm: str = os.getenv("SHUTDOWN_HHMM", "15:40")
@@ -143,6 +167,10 @@ class Settings:
             raise ValueError("WATCHLIST_SAMPLE_SIZE는 0 이상이어야 합니다. 예: 10")
         if self.result_csv_kis_lookback_days < 1 or self.result_csv_kis_lookback_days > 90:
             raise ValueError("RESULT_CSV_KIS_LOOKBACK_DAYS는 1~90(3개월 이내)이어야 합니다.")
+        if not (self.enable_k_range or self.enable_prev_high or self.enable_opening_drive):
+            raise ValueError("ENABLE_K_RANGE / ENABLE_PREV_HIGH / ENABLE_OPENING_DRIVE 중 하나 이상 true")
+        if self.od_gap_min >= self.od_gap_max:
+            raise ValueError("OD_GAP_MIN must be < OD_GAP_MAX")
 
 
 settings = Settings()

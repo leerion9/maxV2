@@ -394,6 +394,8 @@ def _mcap_span(p: dict) -> str:
 
 
 def _buy_base_label(p: dict) -> str:
+    if p.get("target_mode") == "prev_high":
+        return "전일 고가 (고가≥전일고가 시 전일고가 체결)"
     mode = p.get("buy_price_mode", "target")
     if mode == "close":
         return "당일 종가 (체결가)"
@@ -401,6 +403,8 @@ def _buy_base_label(p: dict) -> str:
 
 
 def _breakout_label(p: dict) -> str:
+    if p.get("target_mode") == "prev_high":
+        return "당일 고가 ≥ 전일 고가"
     if p.get("require_breakout", True):
         base = "당일 고가 ≥ 시가 + (전일 고−저) × K"
         if p.get("require_target_in_range"):
@@ -423,6 +427,22 @@ def _cost_pct(p: dict) -> str:
     return f"{pct:.1f}%"
 
 
+def _liquidity_label(p: dict) -> str:
+    v = p.get("value_ma5_min")
+    if v is None:
+        return "미적용"
+    return f"전일 5일평균 거래대금 ≥ {v / 1e8:.0f}억원"
+
+
+def _instrument_label(p: dict) -> str:
+    f = p.get("instrument_filter", "all")
+    return {
+        "all": "전체 (제한 없음)",
+        "exclude_etf": "ETF·ETN 제외 (market≠etf외)",
+        "etf_only": "ETF·ETN만 (market=etf외)",
+    }.get(f, f)
+
+
 def _vol_label(p: dict) -> str:
     if not p.get("use_volume", True):
         return "미적용 (필터 제거)"
@@ -435,6 +455,8 @@ def _vol_label(p: dict) -> str:
 
 
 def _mcap_label(p: dict) -> str:
+    if not p.get("use_mcap", True):
+        return "미적용 (필터 제거)"
     mode = p.get("mcap_mode", "snapshot")
     span = _mcap_span(p)
     if "point-in-time" in mode:
@@ -453,15 +475,20 @@ def _build_cond_rows(p: dict) -> list[list[str]]:
         ["시총 필터", _mcap_label(p)],
         ["돌파 조건", _breakout_label(p)],
         ["매수 체결가", _buy_base_label(p)],
-        ["K값 (전일 변동폭 계수)", f"{p['K']}"],
+    ]
+    if p.get("target_mode") != "prev_high":
+        rows.append(["K값 (전일 변동폭 계수)", f"{p['K']}"])
+    rows.extend([
         ["거래대금 조건", _vol_label(p)],
+        ["유동성 하한 (5일평균)", _liquidity_label(p)],
+        ["종목 유형 필터", _instrument_label(p)],
         ["시장 필터", "전일 종가 > 전일 MA5" if p.get("use_ma5_filter", True) else "미적용"],
         ["매도 / 거래비용", f"{_sell_label(p)} · {_cost_pct(p)}"],
         ["시작 뱅크롤", f"{p['initial_bankroll']:,.0f}원 (복리)"],
         ["슬롯 / 일 최대 종목", f"뱅크롤 ÷ {p['max_daily_positions']} · 최대 {p['max_daily_positions']}종"],
         ["신호 초과 시", f"랜덤 추출 (seed={p['seed']})"],
         ["뱅크롤 평가 시점", "매일 아침 시가 매도 후 현금"],
-    ]
+    ])
     return rows
 
 

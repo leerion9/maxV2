@@ -4,12 +4,16 @@
 
 > **2026-07-06 페이스 게이트 재설계**: 현재는 **페이퍼(관찰) 모드**(`PAPER_MODE=true`, 기본값)로 운용 중이며, 실주문은 발송되지 않습니다. 진입의 거래량 조건은 구 "조건 A(누적 거래량 ≥ 5일평균)"에서 **실시간 거래대금 페이스 게이트**로 전면 교체되었습니다. 명세 원본: `c:\cursor\04_fable5\WORK_ORDER_pace_gate.md`
 
-## 핵심 전략 (2026-07-06 개정)
+## 핵심 전략 (2026-07-11 — 3전략 병행 페이퍼)
+- `python main.py` 한 번으로 K 돌파·전일고가·Opening Drive를 **동시** 운용합니다 (전략별 독립 뱅크롤·원장).
+  1. **K 돌파** (`ENABLE_K_RANGE`) → `logs/paper_ledger.csv`
+  2. **전일고가** (`ENABLE_PREV_HIGH`) → `logs/paper_ledger_prev_high.csv`
+  3. **Opening Drive** (`ENABLE_OPENING_DRIVE`, 당일청산) → `logs/paper_ledger_opening_drive.csv`
 - 유니버스: **보통주+우선주** 중 전일 시총 상위 10% + 전일 종가 > MA5 (네이버 기반, 전일 확정)
-  - **제외(2026-07-08 고정)**: ETF·ETN·펀드·스팩·리츠·인프라펀드 — 시총 랭킹 산정 전에 이름 규칙으로 필터 (`core/naver_universe.py`)
-  - **포함**: 우선주 (예: LG전자우)
+  - **제외**: ETN·스팩·리츠·인프라·선박투자·(일반)펀드 — 이름 규칙 (`core/naver_universe.py`). **ETF는 제외하지 않음**(시총 상위 10%+MA5로 편입). `메리츠`→`리츠` 오탐 방지 포함.
+  - **포함**: 우선주, **대형 ETF**(네이버 시총 값 기준 상위권)
 - 진입 (09:10~15:20 KST, 아래 전부 충족 시):
-  - 현재가 ≥ 돌파가 (당일 시가 + 전일 (고가−저가) × K=0.7)
+  - 현재가 ≥ 돌파가 — K암: 시가+전일(고−저)×0.7 / 전일고가암: 전일 고가 (병행)
   - **페이스 게이트**: `pace_ratio = (당일 누적 거래대금 ÷ f(t)) ÷ 5일평균 거래대금 ≥ 3.0`
     - f(t) = 시간대별 하루 누적 거래대금 비중 계수표 (`config/pace_constants.py`, 사전 고정 — 임의 수정 금지)
   - 추격 제한: 현재가 ≤ 돌파가 × 1.02
@@ -106,9 +110,11 @@ maxv/
 |---|---|
 | `gate_YYYYMMDD.csv` | 돌파가 도달 전수 기록 (pace_ratio, gate_pass, block_reason; 종목당 최소 60초 간격, **진입 순간은 스로틀 무시·반드시 기록**) |
 | `value_profile_YYYYMMDD.csv` | 유니버스 전 종목 5분 간격 누적 거래대금 스냅샷 (**행별 시세 수신 시각** 기록 — f(t) 보정용) |
-| `paper_ledger.csv` | 가상 원장 (누적). 헤더 바로 아래 **한국어 설명 행** 포함(`#` 접두). `exit_open_date`로 청산 시가의 소속 세션 검증 가능 |
+| `paper_ledger.csv` | **K=0.7** 가상 원장 (계속 적재) |
+| `paper_ledger_prev_high.csv` | **전일고가** 가상 원장 |
+| `paper_ledger_opening_drive.csv` | **Opening Drive** 당일매매 원장 |
 
-#### `paper_ledger.csv` 컬럼 (2행째 = 의미)
+#### 페이퍼 원장 컬럼 (2행째 = 의미)
 
 | date | symbol | entry_ts | entry_price | breakout_price | qty | exit_open_date | exit_open_next | pnl_open_next_bp | exit_close_same | pnl_close_same_bp | pace_ratio_at_entry | fees_bp | net_pnl_open_next_bp |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|
@@ -149,6 +155,9 @@ SYMBOL_MASTER_MAX_AGE_DAYS=7
 # 페이스 게이트 + 페이퍼 모드 (기본값 = 작업 지시서 사전 고정값)
 PAPER_MODE=true
 PAPER_CAPITAL=10000000
+ENABLE_K_RANGE=true
+ENABLE_PREV_HIGH=true
+ENABLE_OPENING_DRIVE=true
 PACE_THRESHOLD=3.0
 PACE_ENTRY_START_HHMM=09:10
 PACE_ENTRY_END_HHMM=15:20

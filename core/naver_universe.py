@@ -27,53 +27,24 @@ _MARKET_SUM_URL = "https://finance.naver.com/sise/sise_market_sum.naver"
 _DAY_URL = "https://finance.naver.com/item/sise_day.naver"
 _MAX_PAGES_PER_MARKET = 120
 
-# --- 비(非)보통주 상품 제외 필터 (2026-07-08, 사전 고정) ---
-# ETF/ETN/펀드/스팩/리츠/인프라펀드는 변동성 돌파 검증 표본이 아니므로 제외.
-# 우선주는 발주자 결정에 따라 포함한다.
-# 브랜드 접두어(ETF 상품명은 브랜드로 시작) — 대문자 비교.
-_ETF_BRAND_PREFIXES = (
-    "KODEX",
-    "TIGER",
-    "ACE",
-    "SOL",
-    "PLUS",
-    "RISE",
-    "HANARO",
-    "KIWOOM",
-    "KOSEF",
-    "KBSTAR",
-    "ARIRANG",
-    "WON",
-    "BNK",
-    "TREX",
-    "FOCUS",
-    "KOACT",
-    "TIMEFOLIO",
-    "UNICORN",
-    "1Q",
-    "VITA",
-    "WOORI",
-    "DAISHIN343",
-    "마이다스",
-    "에셋플러스",
-    "마이티",
-    "파워",
-    "히어로즈",
-)
-# 이름 어디에든 포함되면 제외하는 토큰.
-_EXCLUDE_NAME_TOKENS = ("ETN", "스팩", "리츠", "인프라", "선박투자", "펀드")
+# --- 비주식 상품 제외 필터 (2026-07-11 개정) ---
+# ETF는 네이버 시총(순자산 규모에 가까운 값) 상위 10% + MA5 필터로 편입한다.
+# ETN / 스팩 / 리츠 / 인프라·선박투자 / (일반)펀드 만 이름 규칙으로 제외.
+# 우선주는 포함한다.
+# "리츠"는 부분문자열 매칭 시 "메리츠" 오탐이 나므로 메리츠를 가린 뒤 검사한다.
+_EXCLUDE_NAME_TOKENS = ("ETN", "스팩", "인프라", "선박투자", "펀드")
 
 
 def is_excluded_instrument(name: str) -> bool:
-    """ETF/ETN/펀드/스팩/리츠/인프라펀드 여부 (우선주는 제외하지 않음)."""
+    """ETN/스팩/리츠/인프라/펀드 여부. ETF·우선주·보통주는 제외하지 않음."""
     n = name.strip().upper()
     if not n:
         return False
+    # REIT: "신한리츠" 등은 제외, "메리츠금융지주"는 오탐 방지
+    if "리츠" in n.replace("메리츠", ""):
+        return True
     for token in _EXCLUDE_NAME_TOKENS:
         if token in n:
-            return True
-    for prefix in _ETF_BRAND_PREFIXES:
-        if n.startswith(prefix):
             return True
     return False
 
@@ -143,9 +114,9 @@ def _fetch_ranked_symbols_merged(
     session: requests.Session, delay_sec: float
 ) -> Tuple[List[str], int]:
     """
-    Market-cap-ranked common-stock codes (KOSPI+KOSDAQ merged).
-    ETF/ETN/펀드/스팩/리츠/인프라펀드는 랭킹 산정 전에 제외한다 — 시총 상위
-    top_ratio 컷의 분모가 보통주(+우선주) 집합이 되도록.
+    Market-cap-ranked codes (KOSPI+KOSDAQ merged), including ETFs.
+    ETN/스팩/리츠/인프라/펀드만 랭킹 전에 제외. ETF는 시총(AUM 근사) 상위
+    top_ratio 컷과 이후 MA5 필터로 걸러진다.
     Returns (ordered_codes, excluded_count).
     """
     merged: Dict[str, int] = {}

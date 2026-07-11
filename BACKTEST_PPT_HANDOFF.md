@@ -54,8 +54,19 @@ python build_backtest_ppt.py --mode snapshot
 | `close_buy` | 기준 · 돌파+종가매수 · 돌파X+종가매수 | `repair_v13_close_buy_sets_compare.pptx` |
 | `vol_sweep` | 100% · 200% · 300%(기준) · 400~600% | `repair_v13_vol_sweep_sets_compare.pptx` |
 | `vol_bands` | 기준(≥300%) · 50~100% … 500~600% · 600%+ | `repair_v13_vol_bands_sets_compare.pptx` |
+| `prev_high_buy` | 기준 · 전일고가 · 전일고가+거래대금X · 시총필터X | `repair_v13_prev_high_buy_sets_compare.pptx` |
 
 세트 추가: `PRESETS` dict에 항목 추가. 각 세트 `over` = `run_baseline()` 인자 중 **기준 대비 바뀌는 것만**.
+
+### 검증 프로세스 (2026-07-10 개정)
+
+**기존**: 전체 백테스트 완료 후 일부 결과만 사후 스팟체크.  
+**변경**: 코드 수정 직후 **샘플 검증 → 전체 백테스트 → 사후 스팟체크** 3단계.
+
+1. **샘플 검증 (수정 직후, 필수)** — `python sample_backtest_check.py` (랜덤 10종)  
+   기준·변경 조건별 신호 건수·체결가 출력. 기준 세트 신호 0건이면 전체 백테스트 중단.
+2. **전체 백테스트** — `build_backtest_ppt_sets.py --preset …`
+3. **사후 스팟체크 (기존 유지)** — 전체 실행 후 대표 종목·일자 수동 대조
 
 ```python
 {"key": "x", "name": "...", "short": "...", "sub": "...",
@@ -150,6 +161,8 @@ python build_backtest_ppt.py --mode snapshot
 | `sell_mode` | next_open | `same_close`=당일 종가 | `--sell-close` |
 | `cost_mult` | 0.99 | 1% 비용. 0.995=0.5% | `--cost 0.5` |
 | `use_ma5` | True | MA5 필터 | `--no-ma5` |
+| `target_mode` | k_breakout | `prev_high`=전일 고가 매수·돌파 | (코드 only) |
+| `use_mcap` | True | `False`=시총 필터 제거 | (코드 only) |
 | `mcap_lag` | 1 | 시총 D-1 | `--mcap-lag` |
 | `seed` | 42 | 랜덤 10종 | `--seed` |
 | `initial_bankroll` | 1e8 | 시작 뱅크롤 | `--bankroll` |

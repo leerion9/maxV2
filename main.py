@@ -9,15 +9,24 @@ from zoneinfo import ZoneInfo
 from config.settings import settings
 from core.api_client import KISApiClient
 from core.logger import TradeLogger
+from core.opening_drive import OpeningDriveStrategy
 from core.order import OrderManager
 from core.pace_collectors import (
     GateCsvLogger,
+    LEDGER_DESC_K_RANGE,
+    LEDGER_DESC_PREV_HIGH,
+    OpeningDriveLedger,
     PaperLedger,
     ValueProfileLogger,
     calc_paper_qty,
 )
 from core.pace_gate import entry_block_reason, evaluate_pace_gate
-from core.strategy import VolatilityBreakoutStrategy
+from core.strategy import (
+    BREAKOUT_MODE_K_RANGE,
+    BREAKOUT_MODE_PREV_HIGH,
+    VolatilityBreakoutStrategy,
+)
+from core.strategy_books import BreakoutBook
 from core.trading_day import load_manual_holiday_set, prev_trading_day_ymd, should_run_bot_today_kst
 from core.universe_cache import CachedSymbol, UniverseCache, cache_path, load_cache, save_cache, today_kst_yyyymmdd
 
@@ -31,7 +40,6 @@ class MaxVRunner:
         self.api = KISApiClient(settings=settings)
         self.logger = TradeLogger(log_dir=settings.log_dir)
         self.order = OrderManager(api=self.api, settings=settings)
-        self.strategy = VolatilityBreakoutStrategy()
         self.symbol_features: Dict[str, CachedSymbol] = {}
         self.gate_logger = GateCsvLogger(
             log_dir=settings.pace_log_dir,
@@ -41,20 +49,63 @@ class MaxVRunner:
             log_dir=settings.pace_log_dir,
             interval_sec=settings.value_profile_interval_sec,
         )
-        self.paper_ledger = PaperLedger(
-            path=settings.pace_log_dir / "paper_ledger.csv",
+
+        # Parallel breakout arms (separate bankroll + ledger each).
+        self.breakout_books: List[BreakoutBook] = []
+        if settings.enable_k_range:
+            self.breakout_books.append(
+                BreakoutBook(
+                    name="k_range",
+                    strategy=VolatilityBreakoutStrategy(breakout_mode=BREAKOUT_MODE_K_RANGE),
+                    ledger=PaperLedger(
+                        path=settings.pace_log_dir / settings.paper_ledger_k_name,
+                        settings=settings,
+                        desc_row=dict(LEDGER_DESC_K_RANGE),
+                    ),
+                    max_positions=settings.max_positions,
+                )
+            )
+        if settings.enable_prev_high:
+            self.breakout_books.append(
+                BreakoutBook(
+                    name="prev_high",
+                    strategy=VolatilityBreakoutStrategy(breakout_mode=BREAKOUT_MODE_PREV_HIGH),
+                    ledger=PaperLedger(
+                        path=settings.pace_log_dir / settings.paper_ledger_prev_high_name,
+                        settings=settings,
+                        desc_row=dict(LEDGER_DESC_PREV_HIGH),
+                    ),
+                    max_positions=settings.max_positions,
+                )
+            )
+
+        self.od_strategy = OpeningDriveStrategy(
+            gap_min=settings.od_gap_min,
+            gap_max=settings.od_gap_max,
+            observe_end_hhmm=settings.od_observe_end_hhmm,
+            stop_pct=settings.od_stop_pct,
+            trail_pct=settings.od_trail_pct,
+            force_exit_hhmm=settings.od_force_exit_hhmm,
+            min_pace_ratio=settings.od_min_pace_ratio,
+        )
+        self.od_ledger = OpeningDriveLedger(
+            path=settings.pace_log_dir / settings.paper_ledger_od_name,
             settings=settings,
         )
+        self.od_ordered_symbols_today: set[str] = set()
+        self.od_buy_orders_today: int = 0
+        self.od_per_symbol_budget: int | None = None
+        self.od_enabled = bool(settings.enable_opening_drive)
 
-        self.today_universe: List[str] = []
-        # Today's buy-order symbols: once we received an order ACK(ord_no),
-        # we never buy the same symbol again today.
+        # Live-mode single-arm counters (paper uses per-book counters).
         self.ordered_symbols_today: set[str] = set()
         self.buy_orders_today: int = 0
+        self.per_symbol_budget: int | None = None
+
+        self.today_universe: List[str] = []
 
         # One-time cash snapshot at 09:00:05(KST).
         self.cash_snapshot_total: int | None = None
-        self.per_symbol_budget: int | None = None
         self.cash_snapshot_done: bool = False
         self.cash_snapshot_failed: bool = False
         self._next_cash_retry_ts: float = 0.0
@@ -81,7 +132,7 @@ class MaxVRunner:
         # revealing the gap.
         self._open_exit_fill_done_ymd: str = ""
         self._next_open_exit_retry_ts: float = 0.0
-
+        self._od_force_flat_ymd: str = ""
     def run(self) -> None:
         self._configure_console_utf8()
 
@@ -95,9 +146,12 @@ class MaxVRunner:
 
         self.logger.info("MaxV started.")
         if settings.paper_mode:
+            arms = [b.name for b in self.breakout_books]
+            if self.od_enabled:
+                arms.append("opening_drive")
             self.logger.info(
                 "paper_mode=ON: KIS 주문 API 차단, 가상 체결·원장 운용 "
-                f"(paper_capital={settings.paper_capital:,} KRW)"
+                f"(paper_capital/전략={settings.paper_capital:,} KRW, arms={arms})"
             )
 
         hhmm = now.strftime("%H:%M")
@@ -159,6 +213,16 @@ class MaxVRunner:
             if settings.paper_mode and self._did_same_day_close_ymd != ymd:
                 self._fill_paper_same_day_close(ymd)
                 self._did_same_day_close_ymd = ymd
+
+        # Opening Drive: force-flat any still-open paper positions at force_exit time.
+        if (
+            settings.paper_mode
+            and self.od_enabled
+            and hhmm >= settings.od_force_exit_hhmm
+            and self._od_force_flat_ymd != ymd
+        ):
+            self._od_force_flat_open(ymd)
+            self._od_force_flat_ymd = ymd
 
         if hhmm >= settings.shutdown_hhmm:
             if self._did_result_csv_ymd != ymd:
@@ -264,7 +328,7 @@ class MaxVRunner:
                 )
                 self.logger.info(
                     f"Naver universe ready: {len(naver_syms)} symbols "
-                    f"(ranked={st.get('naver_ranked', 0)} excluded_etf_etc={st.get('excluded', 0)} "
+                    f"(ranked={st.get('naver_ranked', 0)} excluded_name={st.get('excluded', 0)} "
                     f"top_n={st.get('top_n', 0)} "
                     f"ma5_pass={st.get('ma5_pass', 0)} daily_fail={st.get('daily_fail', 0)})"
                 )
@@ -290,7 +354,22 @@ class MaxVRunner:
 
         self.today_universe = symbols
         self.symbol_features = dict(features)
-        self.strategy = VolatilityBreakoutStrategy()
+        for book in self.breakout_books:
+            book.strategy = VolatilityBreakoutStrategy(breakout_mode=book.strategy.breakout_mode)
+            book.reset_day_counters()
+        self.od_strategy = OpeningDriveStrategy(
+            gap_min=settings.od_gap_min,
+            gap_max=settings.od_gap_max,
+            observe_end_hhmm=settings.od_observe_end_hhmm,
+            stop_pct=settings.od_stop_pct,
+            trail_pct=settings.od_trail_pct,
+            force_exit_hhmm=settings.od_force_exit_hhmm,
+            min_pace_ratio=settings.od_min_pace_ratio,
+        )
+        self.od_ordered_symbols_today = set()
+        self.od_buy_orders_today = 0
+        self.ordered_symbols_today = set()
+        self.buy_orders_today = 0
         self._reset_heartbeat_counters()
 
         # Strategy prep: prefer cached/naver features, avoid KIS daily calls when available.
@@ -299,12 +378,15 @@ class MaxVRunner:
         for symbol in symbols:
             feat = features.get(symbol)
             if feat is not None:
-                self.strategy.register(
-                    symbol=symbol,
-                    prev_high=feat.prev_high,
-                    prev_low=feat.prev_low,
-                    breakout_k=settings.breakout_k,
-                )
+                for book in self.breakout_books:
+                    book.strategy.register(
+                        symbol=symbol,
+                        prev_high=feat.prev_high,
+                        prev_low=feat.prev_low,
+                        breakout_k=settings.breakout_k,
+                    )
+                if self.od_enabled:
+                    self.od_strategy.register(symbol=symbol, prev_close=feat.prev_close)
                 continue
 
             try:
@@ -325,12 +407,15 @@ class MaxVRunner:
                     value_ma5=value_ma5,
                     prev_close=prev_close,
                 )
-                self.strategy.register(
-                    symbol=symbol,
-                    prev_high=prev_high,
-                    prev_low=prev_low,
-                    breakout_k=settings.breakout_k,
-                )
+                for book in self.breakout_books:
+                    book.strategy.register(
+                        symbol=symbol,
+                        prev_high=prev_high,
+                        prev_low=prev_low,
+                        breakout_k=settings.breakout_k,
+                    )
+                if self.od_enabled:
+                    self.od_strategy.register(symbol=symbol, prev_close=prev_close)
             except Exception as exc:  # noqa: BLE001
                 self.logger.error(f"Strategy prep failed {symbol}: {exc}")
                 continue
@@ -340,10 +425,13 @@ class MaxVRunner:
             sample_n = min(len(self.today_universe), settings.watchlist_sample_size)
             sample = ",".join(self.today_universe[:sample_n])
             self.logger.info(f"감시대상 샘플 ({sample_n}/{len(self.today_universe)}): {sample}")
+        arms = [b.name for b in self.breakout_books] + (
+            ["opening_drive"] if self.od_enabled else []
+        )
         self.logger.info(
             "감시 준비 완료. "
             f"{settings.monitor_start_hhmm}~{settings.monitor_end_hhmm} (KST) 구간에서 감시합니다. "
-            f"(poll={settings.poll_interval_sec}s, heartbeat={settings.heartbeat_sec}s)"
+            f"(poll={settings.poll_interval_sec}s, heartbeat={settings.heartbeat_sec}s, arms={arms})"
         )
     def liquidate_all_holdings_at_open(self) -> None:
         """
@@ -414,7 +502,6 @@ class MaxVRunner:
                 self._maybe_heartbeat(
                     "waiting",
                     f"대기중... now={now_kst} KST watchlist={len(self.today_universe)} "
-                    f"orders={self.buy_orders_today}/{settings.max_positions} "
                     f"cash_snapshot={'Y' if self.cash_snapshot_done else 'N'}",
                 )
             return
@@ -428,16 +515,21 @@ class MaxVRunner:
             self._maybe_heartbeat(
                 "cash_snapshot_wait",
                 f"감시중... now={now_kst} KST watchlist={len(self.today_universe)} "
-                f"orders={self.buy_orders_today}/{settings.max_positions} "
                 f"cash_snapshot={snap_state}(09:00:05~09:05 재시도)",
             )
             return
 
-        can_buy = self.buy_orders_today < settings.max_positions
-        budget = int(self.per_symbol_budget or 0)
-        if budget <= 0:
-            self.logger.error("Per-symbol budget invalid. Keep monitoring only.")
-            return
+        if settings.paper_mode:
+            if any(b.budget() <= 0 for b in self.breakout_books) or (
+                self.od_enabled and int(self.od_per_symbol_budget or 0) <= 0
+            ):
+                self.logger.error("Per-symbol budget invalid. Keep monitoring only.")
+                return
+        else:
+            budget = int(self.per_symbol_budget or 0)
+            if budget <= 0:
+                self.logger.error("Per-symbol budget invalid. Keep monitoring only.")
+                return
 
         snapshot_profile = self.profile_logger.should_snapshot()
         profile_rows: List[Dict[str, object]] = []
@@ -459,10 +551,8 @@ class MaxVRunner:
                 cycle_quote_err += 1
                 continue
 
-            # Quote-time timestamp: a full universe scan takes tens of seconds
-            # under the KIS rate limit, so both the profile row and the gate
-            # evaluation use the per-quote clock, not the cycle-start clock.
             quote_dt = self._now_kst_local()
+            quote_hhmm = quote_dt.strftime("%H:%M")
             feat = self.symbol_features.get(symbol)
             if snapshot_profile and feat is not None:
                 profile_rows.append(
@@ -476,99 +566,132 @@ class MaxVRunner:
                     }
                 )
 
-            signal = self.strategy.on_quote(quote)
-            state = self.strategy.symbol_state.get(symbol)
-            breakout_price = int(state.breakout_price or 0) if state else 0
-            if breakout_price <= 0 or quote.current_price < breakout_price or feat is None:
+            if feat is None:
                 continue
 
-            # Breakout reached: the pace gate is the sole volume condition.
-            gate = evaluate_pace_gate(
-                cum_value=quote.cum_value,
-                value_ma5=feat.value_ma5,
-                now_hhmm=quote_dt.strftime("%H:%M"),
-                current_price=quote.current_price,
-                breakout_price=breakout_price,
-                prev_close=feat.prev_close,
-                pace_threshold=settings.pace_threshold,
-                entry_start_hhmm=settings.pace_entry_start_hhmm,
-                entry_end_hhmm=settings.pace_entry_end_hhmm,
-                chase_limit_mult=settings.pace_chase_limit_mult,
-                upper_limit_mult=settings.pace_upper_limit_mult,
-            )
-            already_ordered = symbol in self.ordered_symbols_today
-            full_cap = not can_buy
-            high_price = breakout_price > budget
-            entered = False
-
-            if (
-                signal is not None
-                and gate.gate_pass
-                and not already_ordered
-                and not full_cap
-                and not high_price
-            ):
-                cycle_signals += 1
-                if settings.paper_mode:
-                    entered = self._paper_virtual_buy(
+            # --- Opening Drive (paper only; same-day) ---
+            if settings.paper_mode and self.od_enabled:
+                od_entry, od_exit = self.od_strategy.on_quote(
+                    quote, now_hhmm=quote_hhmm, value_ma5=feat.value_ma5
+                )
+                if od_exit is not None:
+                    self._od_paper_exit(
                         ymd=ymd,
                         symbol=symbol,
-                        quote=quote,
-                        breakout_price=breakout_price,
-                        budget=budget,
-                        pace_ratio=gate.pace_ratio,
-                        reason=signal.reason,
+                        exit_price=od_exit.exit_price,
+                        exit_reason=od_exit.reason,
+                        exit_ts=quote_dt.isoformat(timespec="seconds"),
                     )
-                else:
-                    entered = self._live_buy(
+                elif od_entry is not None:
+                    entered_od = self._od_paper_buy(
+                        ymd=ymd,
                         symbol=symbol,
-                        signal=signal,
-                        budget=budget,
+                        entry=od_entry,
+                        entry_ts=quote_dt.isoformat(timespec="seconds"),
                     )
-                if entered:
-                    self.strategy.confirm_entry(symbol)
-                    cycle_buys += 1
-                    if self.buy_orders_today >= settings.max_positions:
-                        can_buy = False
-            elif signal is not None and gate.gate_pass and not already_ordered:
-                # Gate passed but portfolio caps blocked the entry.
-                cycle_signals += 1
-                cycle_skipped_signals += 1
-                action = "SKIP_FULL_CAP" if full_cap else "SKIP_HIGH_PRICE"
-                note = (
-                    "당일 매수 주문 한도 도달(주문 스킵)"
-                    if full_cap
-                    else "주가 고가(1주가 예산 초과)"
-                )
-                self.logger.log_signal(
-                    {
-                        "symbol": symbol,
-                        "breakout_price": breakout_price,
-                        "reason": signal.reason,
-                        "action": action,
-                        "note": note,
-                    }
+                    if entered_od:
+                        cycle_signals += 1
+                        cycle_buys += 1
+
+            # --- Breakout arms (K + prev_high) ---
+            for book in self.breakout_books:
+                signal = book.strategy.on_quote(quote)
+                state = book.strategy.symbol_state.get(symbol)
+                breakout_price = int(state.breakout_price or 0) if state else 0
+                if breakout_price <= 0 or quote.current_price < breakout_price:
+                    continue
+
+                gate = evaluate_pace_gate(
+                    cum_value=quote.cum_value,
+                    value_ma5=feat.value_ma5,
+                    now_hhmm=quote_hhmm,
+                    current_price=quote.current_price,
+                    breakout_price=breakout_price,
+                    prev_close=feat.prev_close,
+                    pace_threshold=settings.pace_threshold,
+                    entry_start_hhmm=settings.pace_entry_start_hhmm,
+                    entry_end_hhmm=settings.pace_entry_end_hhmm,
+                    chase_limit_mult=settings.pace_chase_limit_mult,
+                    upper_limit_mult=settings.pace_upper_limit_mult,
                 )
 
-            block = entry_block_reason(
-                gate=gate,
-                already_ordered=already_ordered,
-                full_cap=full_cap,
-                high_price=high_price,
-            )
-            self.gate_logger.maybe_log(
-                ymd=ymd,
-                symbol=symbol,
-                breakout_price=breakout_price,
-                current_price=quote.current_price,
-                cum_value=quote.cum_value,
-                value_ma5=feat.value_ma5,
-                gate=gate,
-                entered=entered,
-                block_reason="" if entered else block,
-            )
-            if entered:
-                time.sleep(0.15)
+                if settings.paper_mode:
+                    already_ordered = symbol in book.ordered_symbols_today
+                    full_cap = not book.can_buy()
+                    budget = book.budget()
+                else:
+                    # Live: only the first enabled breakout arm places real orders.
+                    if book is not self.breakout_books[0]:
+                        continue
+                    already_ordered = symbol in self.ordered_symbols_today
+                    full_cap = self.buy_orders_today >= settings.max_positions
+                    budget = int(self.per_symbol_budget or 0)
+
+                high_price = breakout_price > budget
+                entered = False
+
+                if (
+                    signal is not None
+                    and gate.gate_pass
+                    and not already_ordered
+                    and not full_cap
+                    and not high_price
+                ):
+                    cycle_signals += 1
+                    if settings.paper_mode:
+                        entered = self._paper_virtual_buy(
+                            book=book,
+                            ymd=ymd,
+                            symbol=symbol,
+                            quote=quote,
+                            breakout_price=breakout_price,
+                            budget=budget,
+                            pace_ratio=gate.pace_ratio,
+                            reason=signal.reason,
+                        )
+                    else:
+                        entered = self._live_buy(
+                            symbol=symbol,
+                            signal=signal,
+                            budget=budget,
+                        )
+                    if entered:
+                        book.strategy.confirm_entry(symbol)
+                        cycle_buys += 1
+                elif signal is not None and gate.gate_pass and not already_ordered:
+                    cycle_signals += 1
+                    cycle_skipped_signals += 1
+                    action = "SKIP_FULL_CAP" if full_cap else "SKIP_HIGH_PRICE"
+                    self.logger.log_signal(
+                        {
+                            "symbol": symbol,
+                            "breakout_price": breakout_price,
+                            "reason": f"{book.name}:{signal.reason}",
+                            "action": action,
+                            "note": book.name,
+                        }
+                    )
+
+                block = entry_block_reason(
+                    gate=gate,
+                    already_ordered=already_ordered,
+                    full_cap=full_cap,
+                    high_price=high_price,
+                )
+                self.gate_logger.maybe_log(
+                    ymd=ymd,
+                    symbol=symbol,
+                    breakout_price=breakout_price,
+                    current_price=quote.current_price,
+                    cum_value=quote.cum_value,
+                    value_ma5=feat.value_ma5,
+                    gate=gate,
+                    entered=entered,
+                    block_reason="" if entered else block,
+                    strategy=book.name,
+                )
+                if entered:
+                    time.sleep(0.15)
 
         if snapshot_profile and profile_rows:
             self.profile_logger.log_snapshot(ymd=ymd, rows=profile_rows)
@@ -580,15 +703,16 @@ class MaxVRunner:
         self._hb_buys += cycle_buys
         self._hb_skipped_signals += cycle_skipped_signals
 
-        hb_cap = ""
-        if self.buy_orders_today >= settings.max_positions:
-            hb_cap = f" (주문 {settings.max_positions}건 도달·감시만)"
+        book_status = ",".join(
+            f"{b.name}:{b.buy_orders_today}/{b.max_positions}" for b in self.breakout_books
+        )
+        if self.od_enabled:
+            book_status += f",od:{self.od_buy_orders_today}/{settings.od_max_positions}"
         emitted = self._maybe_heartbeat(
             "monitoring",
             "감시중... "
             f"now={now_kst} KST watchlist={len(self.today_universe)} "
-            f"orders={self.buy_orders_today}/{settings.max_positions} "
-            f"budget={budget}{hb_cap} "
+            f"arms=[{book_status}] "
             f"paper={'Y' if settings.paper_mode else 'N'} "
             f"(cycles={self._hb_cycles}, quote_err={self._hb_quote_err}, "
             f"signals={self._hb_signals}, buys={self._hb_buys}, skip={self._hb_skipped_signals})",
@@ -650,6 +774,7 @@ class MaxVRunner:
     def _paper_virtual_buy(
         self,
         *,
+        book: BreakoutBook,
         ymd: str,
         symbol: str,
         quote,
@@ -661,11 +786,11 @@ class MaxVRunner:
         entry_price = int(quote.current_price)
         qty = calc_paper_qty(budget, entry_price)
         if qty <= 0:
-            self.logger.error(f"PAPER BUY qty=0 {symbol} entry={entry_price}")
+            self.logger.error(f"PAPER BUY qty=0 {book.name} {symbol} entry={entry_price}")
             return False
 
         entry_ts = self._now_kst_local().isoformat(timespec="seconds")
-        self.paper_ledger.append_entry(
+        book.ledger.append_entry(
             ymd=ymd,
             symbol=symbol,
             entry_ts=entry_ts,
@@ -674,8 +799,8 @@ class MaxVRunner:
             qty=qty,
             pace_ratio_at_entry=pace_ratio,
         )
-        self.ordered_symbols_today.add(symbol)
-        self.buy_orders_today += 1
+        book.ordered_symbols_today.add(symbol)
+        book.buy_orders_today += 1
         slip_bp = 0.0
         if breakout_price > 0:
             slip_bp = (entry_price / breakout_price - 1.0) * 10000.0
@@ -683,7 +808,7 @@ class MaxVRunner:
             {
                 "symbol": symbol,
                 "breakout_price": breakout_price,
-                "reason": reason,
+                "reason": f"{book.name}:{reason}",
                 "action": "PAPER_BUY",
                 "note": f"entry={entry_price} slip_bp={slip_bp:.1f}",
             }
@@ -694,7 +819,7 @@ class MaxVRunner:
                 "side": "BUY",
                 "qty": qty,
                 "price": entry_price,
-                "reason": f"paper_virtual:{reason}",
+                "reason": f"paper_virtual:{book.name}:{reason}",
                 "fee": "",
                 "tax": "",
                 "order_id": "PAPER",
@@ -705,19 +830,104 @@ class MaxVRunner:
             }
         )
         self.logger.info(
-            f"[페이퍼매수] {symbol} entry={entry_price} breakout={breakout_price} "
+            f"[페이퍼매수/{book.name}] {symbol} entry={entry_price} breakout={breakout_price} "
             f"qty={qty} pace_ratio={pace_ratio:.2f} slip_bp={slip_bp:.1f}"
         )
         return True
 
+    def _od_paper_buy(self, *, ymd: str, symbol: str, entry, entry_ts: str) -> bool:
+        if symbol in self.od_ordered_symbols_today:
+            return False
+        if self.od_buy_orders_today >= settings.od_max_positions:
+            return False
+        budget = int(self.od_per_symbol_budget or 0)
+        qty = calc_paper_qty(budget, entry.entry_price)
+        if qty <= 0:
+            self.logger.error(f"OD PAPER BUY qty=0 {symbol} entry={entry.entry_price}")
+            return False
+        self.od_ledger.append_entry(
+            ymd=ymd,
+            symbol=symbol,
+            entry_ts=entry_ts,
+            entry_price=int(entry.entry_price),
+            trigger_price=int(entry.trigger_price),
+            qty=qty,
+            gap_pct=float(entry.gap_pct) * 100.0,
+            observe_high=int(entry.observe_high),
+            pace_ratio_at_entry=float(entry.pace_ratio),
+        )
+        self.od_strategy.confirm_entry(symbol, entry.entry_price)
+        self.od_ordered_symbols_today.add(symbol)
+        self.od_buy_orders_today += 1
+        self.logger.log_signal(
+            {
+                "symbol": symbol,
+                "breakout_price": entry.trigger_price,
+                "reason": "opening_drive",
+                "action": "PAPER_BUY",
+                "note": f"gap_pct={entry.gap_pct*100:.2f} observe_high={entry.observe_high}",
+            }
+        )
+        self.logger.info(
+            f"[페이퍼매수/opening_drive] {symbol} entry={entry.entry_price} "
+            f"trigger={entry.trigger_price} qty={qty} gap={entry.gap_pct*100:.2f}% "
+            f"pace={entry.pace_ratio:.2f}"
+        )
+        return True
+
+    def _od_paper_exit(
+        self,
+        *,
+        ymd: str,
+        symbol: str,
+        exit_price: int,
+        exit_reason: str,
+        exit_ts: str,
+    ) -> None:
+        ok = self.od_ledger.fill_exit(
+            ymd=ymd,
+            symbol=symbol,
+            exit_ts=exit_ts,
+            exit_price=exit_price,
+            exit_reason=exit_reason,
+        )
+        if ok:
+            self.logger.info(
+                f"[페이퍼매도/opening_drive] {symbol} exit={exit_price} reason={exit_reason}"
+            )
+
+    def _od_force_flat_open(self, ymd: str) -> None:
+        open_syms = self.od_ledger.symbols_open(ymd=ymd)
+        if not open_syms:
+            return
+        exit_ts = self._now_kst_local().isoformat(timespec="seconds")
+        for symbol in open_syms:
+            try:
+                quote = self.api.get_quote(symbol)
+                px = int(quote.current_price or 0)
+            except Exception as exc:  # noqa: BLE001
+                self.logger.error(f"OD force-flat quote failed {symbol}: {exc}")
+                continue
+            if px <= 0:
+                continue
+            self._od_paper_exit(
+                ymd=ymd,
+                symbol=symbol,
+                exit_price=px,
+                exit_reason="FORCE_CLOSE",
+                exit_ts=exit_ts,
+            )
+            time.sleep(0.15)
+
     def _fill_paper_open_exits(self, ymd: str) -> bool:
         """
         당일 시가로 이전 세션 진입분의 exit_open_next를 소급 기입한다.
-        09:00 동시호가 이후에만 시가가 존재하므로 09:01 이후에 호출된다.
-
-        Returns True when nothing is pending anymore (all filled).
+        K / prev_high 원장 모두 채운다 (Opening Drive는 당일청산이라 대상 아님).
         """
-        symbols_needed = self.paper_ledger.symbols_pending_open_exit(before_ymd=ymd)
+        ledgers = [b.ledger for b in self.breakout_books]
+        symbols_needed: set[str] = set()
+        for led in ledgers:
+            symbols_needed.update(led.symbols_pending_open_exit(before_ymd=ymd))
         if not symbols_needed:
             self.logger.info(f"paper_mode: 익일 시가 청산 대상 없음 (ymd={ymd})")
             return True
@@ -734,16 +944,21 @@ class MaxVRunner:
 
         holidays = load_manual_holiday_set(settings.holiday_dates_path)
         expected_entry = prev_trading_day_ymd(ymd, holidays)
-        n, anomalies = self.paper_ledger.fill_next_open_exits(
-            exit_ymd=ymd, symbol_opens=opens, expected_entry_ymd=expected_entry
-        )
-        self.logger.info(
-            f"paper_mode: 익일 시가 청산 기록 {n}건 (ymd={ymd}, expected_entry={expected_entry})"
-        )
-        for msg in anomalies:
-            self.logger.error(
-                f"paper_mode: 시가 청산 이례 건 — 직전 거래일 진입이 아님(거래정지/기입 누락 의심): {msg}"
+        total_n = 0
+        for led in ledgers:
+            n, anomalies = led.fill_next_open_exits(
+                exit_ymd=ymd, symbol_opens=opens, expected_entry_ymd=expected_entry
             )
+            total_n += n
+            for msg in anomalies:
+                self.logger.error(
+                    f"paper_mode: 시가 청산 이례 건 — 직전 거래일 진입이 아님"
+                    f"(거래정지/기입 누락 의심) [{led.path.name}]: {msg}"
+                )
+        self.logger.info(
+            f"paper_mode: 익일 시가 청산 기록 {total_n}건 "
+            f"(ymd={ymd}, expected_entry={expected_entry})"
+        )
 
         missing = [s for s in symbols_needed if s not in opens]
         if missing:
@@ -755,25 +970,28 @@ class MaxVRunner:
 
     def _fill_paper_same_day_close(self, ymd: str) -> None:
         """
-        당일 종가 비교 청산(기록 전용). 15:20 직후의 현재가를 사용하므로
-        공식 종가(15:30 동시호가)와 다를 수 있다 — 분석 시 이 편차를 감안할 것.
-        원장 CSV에서 직접 대상을 찾으므로 장중 재시작에도 유실이 없다.
+        당일 종가 비교 청산(기록 전용) — breakout 원장들.
+        Opening Drive는 이미 당일 청산되므로 여기 대상이 아님.
         """
-        pending_symbols = self.paper_ledger.symbols_pending_same_day_close(ymd=ymd)
-        if not pending_symbols:
-            return
-        for symbol in pending_symbols:
-            try:
-                quote = self.api.get_quote(symbol)
-                self.paper_ledger.fill_same_day_close(
-                    ymd=ymd, symbol=symbol, exit_close=int(quote.current_price)
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.logger.error(f"PAPER same-day close failed {symbol}: {exc}")
-            time.sleep(0.15)
-        self.logger.info(
-            f"paper_mode: 당일 종가 비교 청산 기록 완료 ({len(pending_symbols)}종목, ymd={ymd})"
-        )
+        for book in self.breakout_books:
+            pending_symbols = book.ledger.symbols_pending_same_day_close(ymd=ymd)
+            if not pending_symbols:
+                continue
+            for symbol in pending_symbols:
+                try:
+                    quote = self.api.get_quote(symbol)
+                    book.ledger.fill_same_day_close(
+                        ymd=ymd, symbol=symbol, exit_close=int(quote.current_price)
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self.logger.error(
+                        f"PAPER same-day close failed [{book.name}] {symbol}: {exc}"
+                    )
+                time.sleep(0.15)
+            self.logger.info(
+                f"paper_mode: 당일 종가 비교 청산 기록 완료 "
+                f"[{book.name}] ({len(pending_symbols)}종목, ymd={ymd})"
+            )
 
     def on_close(self) -> None:
         self.logger.info("Market monitoring closed at 15:30.")
@@ -837,7 +1055,7 @@ class MaxVRunner:
     def _ensure_cash_snapshot_for_today(self) -> bool:
         """
         09:00:05(KST)에 주문가능현금을 1회 조회해 고정 예산(5등분)을 만든다.
-        paper_mode이면 KIS 조회 없이 paper_capital을 5등분한다.
+        paper_mode이면 KIS 조회 없이 전략별 paper_capital을 각각 5등분한다.
         """
         if settings.paper_mode:
             if self.cash_snapshot_done:
@@ -851,12 +1069,17 @@ class MaxVRunner:
                 self.logger.error("paper_capital invalid. No buys today.")
                 return False
             self.cash_snapshot_total = capital
-            self.per_symbol_budget = int(capital // int(settings.max_positions))
+            per = int(capital // int(settings.max_positions))
+            for book in self.breakout_books:
+                book.per_symbol_budget = int(capital // int(book.max_positions))
+            self.od_per_symbol_budget = int(capital // int(settings.od_max_positions))
+            self.per_symbol_budget = per
             self.cash_snapshot_done = True
             self.logger.info(
-                "페이퍼 예산 스냅샷 완료. "
-                f"paper_capital={capital} budget={self.per_symbol_budget} "
-                f"orders_cap={settings.max_positions}"
+                "페이퍼 예산 스냅샷 완료(전략별 독립). "
+                f"paper_capital/전략={capital} "
+                f"breakout_budget={per} od_budget={self.od_per_symbol_budget} "
+                f"orders_cap={settings.max_positions}/{settings.od_max_positions}"
             )
             return True
 
