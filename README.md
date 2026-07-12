@@ -4,12 +4,17 @@
 
 > **2026-07-06 페이스 게이트 재설계**: 현재는 **페이퍼(관찰) 모드**(`PAPER_MODE=true`, 기본값)로 운용 중이며, 실주문은 발송되지 않습니다. 진입의 거래량 조건은 구 "조건 A(누적 거래량 ≥ 5일평균)"에서 **실시간 거래대금 페이스 게이트**로 전면 교체되었습니다. 명세 원본: `c:\cursor\04_fable5\WORK_ORDER_pace_gate.md`
 
-## 핵심 전략 (2026-07-11 — 4전략 병행 페이퍼)
+## 핵심 전략 (2026-07-12 — 5전략 병행 페이퍼)
 - `python main.py` 한 번으로 아래를 **동시** 운용합니다 (전략별 독립 뱅크롤·원장).
   1. **K 돌파** (`ENABLE_K_RANGE`) → `logs/paper_ledger.csv`
   2. **전일고가** (`ENABLE_PREV_HIGH`) → `logs/paper_ledger_prev_high.csv`
   3. **Opening Drive** (`ENABLE_OPENING_DRIVE`, 당일청산) → `logs/paper_ledger_opening_drive.csv`
   4. **테마맵** (`ENABLE_THEME_MAP`, 당일청산) → `logs/paper_ledger_theme_map.csv`
+  5. **응축 스코어(VDU)** (`ENABLE_VDU_SCORE`) → `logs/paper_ledger_vdu_score.csv`
+     - 장전: 응축 점수(VDU/ATR수축/이평수렴/PP/OBV/MFI) ≥70 후보(최대 30)
+     - 장중: K=0.7 돌파 + **pace ≥ 2.0** (기존 K는 3.0)
+     - 청산: 익일 시가 (K와 동일). 점수 전수: `logs/vdu_score_YYYYMMDD.csv`
+     - 명세: `c:\cursor\04_fable5\WORK_ORDER_vdu_score.md`
 - 테마맵: 매주 금요일 장후 `python -m scripts.update_theme_map`로 `config/theme_map.csv` 갱신.
   - 테마 내 종목 **12개 초과** → `eligible=0` (매매 후보 제외)
   - 장중: 핫테마(당일 +2% 이상 비중 ≥50%) → 후발주(테마 중앙 수익률 미만) 당일고점 돌파 + pace≥1.5

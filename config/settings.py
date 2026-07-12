@@ -40,12 +40,18 @@ class Settings:
     enable_prev_high: bool = _env_bool("ENABLE_PREV_HIGH", "true")
     enable_opening_drive: bool = _env_bool("ENABLE_OPENING_DRIVE", "true")
     enable_theme_map: bool = _env_bool("ENABLE_THEME_MAP", "true")
+    enable_vdu_score: bool = _env_bool("ENABLE_VDU_SCORE", "true")
 
     # Pace gate + paper observation mode (WORK_ORDER pace_gate)
     paper_mode: bool = os.getenv("PAPER_MODE", "true").lower() == "true"
-    # Per-strategy paper capital (K / prev_high / OD / theme each get this amount).
+    # Per-strategy paper capital (K / prev_high / OD / theme / vdu each get this amount).
     paper_capital: int = int(os.getenv("PAPER_CAPITAL", "10000000") or "10000000")
     pace_threshold: float = float(os.getenv("PACE_THRESHOLD", "3.0") or "3.0")
+    # VDU score arm: condensation overnight + milder pace ignition (WORK_ORDER_vdu_score).
+    vdu_score_min: int = int(os.getenv("VDU_SCORE_MIN", "70") or "70")
+    vdu_pace_threshold: float = float(os.getenv("VDU_PACE_THRESHOLD", "2.0") or "2.0")
+    vdu_max_candidates: int = int(os.getenv("VDU_MAX_CANDIDATES", "30") or "30")
+    vdu_max_positions: int = int(os.getenv("VDU_MAX_POSITIONS", "5") or "5")
     pace_entry_start_hhmm: str = os.getenv("PACE_ENTRY_START_HHMM", "09:10")
     pace_entry_end_hhmm: str = os.getenv("PACE_ENTRY_END_HHMM", "15:20")
     pace_chase_limit_mult: float = float(os.getenv("PACE_CHASE_LIMIT_MULT", "1.02") or "1.02")
@@ -62,6 +68,7 @@ class Settings:
     paper_ledger_prev_high_name: str = "paper_ledger_prev_high.csv"
     paper_ledger_od_name: str = "paper_ledger_opening_drive.csv"
     paper_ledger_theme_name: str = "paper_ledger_theme_map.csv"
+    paper_ledger_vdu_name: str = "paper_ledger_vdu_score.csv"
 
     # Opening Drive (fixed mock set from HANDOFF)
     od_gap_min: float = float(os.getenv("OD_GAP_MIN", "0.015") or "0.015")
@@ -191,11 +198,18 @@ class Settings:
             or self.enable_prev_high
             or self.enable_opening_drive
             or self.enable_theme_map
+            or self.enable_vdu_score
         ):
             raise ValueError(
                 "ENABLE_K_RANGE / ENABLE_PREV_HIGH / ENABLE_OPENING_DRIVE / "
-                "ENABLE_THEME_MAP 중 하나 이상 true"
+                "ENABLE_THEME_MAP / ENABLE_VDU_SCORE 중 하나 이상 true"
             )
+        if self.vdu_score_min < 0 or self.vdu_score_min > 100:
+            raise ValueError("VDU_SCORE_MIN must be 0..100")
+        if self.vdu_max_candidates < 1:
+            raise ValueError("VDU_MAX_CANDIDATES must be >= 1")
+        if self.vdu_max_positions < 1:
+            raise ValueError("VDU_MAX_POSITIONS must be >= 1")
         if self.od_gap_min >= self.od_gap_max:
             raise ValueError("OD_GAP_MIN must be < OD_GAP_MAX")
         if self.theme_min_members < 1 or self.theme_max_members < self.theme_min_members:

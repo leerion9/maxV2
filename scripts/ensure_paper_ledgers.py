@@ -2,11 +2,10 @@
 """Create empty paper ledgers with UTF-8 BOM + Korean description rows."""
 from __future__ import annotations
 
-from pathlib import Path
-
 from config.settings import settings
 from core.pace_collectors import (
     LEDGER_DESC_ROW,
+    LEDGER_DESC_VDU_SCORE,
     PaperLedger,
     OpeningDriveLedger,
     ThemeMapLedger,
@@ -19,6 +18,8 @@ def _desc_for_mode(mode: str) -> dict:
         row["breakout_price"] = (
             "돌파가(시가+전일 고저폭xK), 매수가와의 차이=슬리피지"
         )
+    elif mode == "vdu_score":
+        return dict(LEDGER_DESC_VDU_SCORE)
     else:
         row["breakout_price"] = (
             "돌파가(전일 고가), 매수가와의 차이=슬리피지"
@@ -34,13 +35,15 @@ def main() -> None:
     ph_path = log_dir / "paper_ledger_prev_high.csv"
     od_path = log_dir / "paper_ledger_opening_drive.csv"
     th_path = log_dir / "paper_ledger_theme_map.csv"
+    vdu_path = log_dir / "paper_ledger_vdu_score.csv"
 
     PaperLedger(path=k_path, settings=settings, desc_row=_desc_for_mode("k_range"))
     PaperLedger(path=ph_path, settings=settings, desc_row=_desc_for_mode("prev_high"))
     OpeningDriveLedger(path=od_path, settings=settings)
     ThemeMapLedger(path=th_path, settings=settings)
+    PaperLedger(path=vdu_path, settings=settings, desc_row=_desc_for_mode("vdu_score"))
 
-    for p in (k_path, ph_path, od_path, th_path):
+    for p in (k_path, ph_path, od_path, th_path, vdu_path):
         raw = p.read_bytes()
         has_bom = raw[:3] == b"\xef\xbb\xbf"
         text = raw.decode("utf-8-sig")

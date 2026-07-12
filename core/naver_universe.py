@@ -185,6 +185,87 @@ def _fetch_daily_bars(session: requests.Session, symbol: str) -> List[DailyBar]:
     return bars
 
 
+def fetch_daily_ohlcv(
+    symbol: str,
+    *,
+    pages: int = 4,
+    delay_sec: float = 0.05,
+    session: requests.Session | None = None,
+) -> List[DailyBar]:
+    """
+    Fetch multiple Naver day pages (newest-first), dedupe by date, return newest-first.
+    ~20 bars/page → pages=4 ≈ 80 sessions (enough for MA60 / ATR lookback).
+    """
+    own = session is None
+    sess = session or requests.Session()
+    if own:
+        sess.headers.update(_UA)
+    merged: Dict[str, DailyBar] = {}
+    try:
+        for page in range(1, max(1, pages) + 1):
+            resp = sess.get(_DAY_URL, params={"code": symbol, "page": page}, timeout=15)
+            resp.encoding = "euc-kr"
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            table = soup.select_one("table.type2")
+            if not table:
+                break
+            page_bars = 0
+            for tr in table.select("tr"):
+                tds = tr.find_all("td")
+                if len(tds) < 7:
+                    continue
+                d0 = tds[0].get_text(strip=True)
+                if not re.match(r"\d{4}\.\d{2}\.\d{2}", d0):
+                    continue
+                close_txt = tds[1].get_text(strip=True).replace(",", "")
+                open_txt = tds[3].get_text(strip=True).replace(",", "")
+                high_txt = tds[4].get_text(strip=True).replace(",", "")
+                low_txt = tds[5].get_text(strip=True).replace(",", "")
+                vol_txt = tds[6].get_text(strip=True).replace(",", "")
+                if not (
+                    close_txt.isdigit()
+                    and open_txt.isdigit()
+                    and high_txt.isdigit()
+                    and low_txt.isdigit()
+                    and vol_txt.isdigit()
+                ):
+                    continue
+                merged[d0] = {
+                    "date": d0,
+                    "open": int(open_txt),
+                    "high": int(high_txt),
+                    "low": int(low_txt),
+                    "close": int(close_txt),
+                    "volume": int(vol_txt),
+                }
+                page_bars += 1
+            if page_bars == 0:
+                break
+            time.sleep(delay_sec)
+    finally:
+        if own:
+            sess.close()
+    # Newest first (same convention as _fetch_daily_bars).
+    return [merged[k] for k in sorted(merged.keys(), reverse=True)]
+
+
+def bars_newest_to_ascending(bars: List[DailyBar]) -> List[Dict[str, int]]:
+    """Convert Naver newest-first bars to chronological ascending dicts for scoring."""
+    out: List[Dict[str, int]] = []
+    for b in reversed(bars):
+        out.append(
+            {
+                "open": int(b["open"]),
+                "high": int(b["high"]),
+                "low": int(b["low"]),
+                "close": int(b["close"]),
+                "volume": int(b["volume"]),
+            }
+        )
+    return out
+
+
 def build_naver_universe(top_ratio: float, delay_sec: float) -> Tuple[List[str], Dict[str, int]]:
     """
     Returns (symbols_after_ma5, stats) using Naver market-cap ranking + MA5 filter.

@@ -90,6 +90,14 @@ LEDGER_DESC_PREV_HIGH["breakout_price"] = (
     "돌파가(전일 고가), 매수가와의 차이=슬리피지"
 )
 
+LEDGER_DESC_VDU_SCORE = dict(LEDGER_DESC_ROW)
+LEDGER_DESC_VDU_SCORE["breakout_price"] = (
+    "돌파가(시가+전일 고저폭xK), 응축스코어 후보만"
+)
+LEDGER_DESC_VDU_SCORE["pace_ratio_at_entry"] = (
+    "진입 순간 페이스 비율(응축암 기본 >=2.0)"
+)
+
 # Opening Drive: same-day round trip (no next-open exit columns).
 OD_LEDGER_FIELDS = [
     "date",

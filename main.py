@@ -15,6 +15,7 @@ from core.pace_collectors import (
     GateCsvLogger,
     LEDGER_DESC_K_RANGE,
     LEDGER_DESC_PREV_HIGH,
+    LEDGER_DESC_VDU_SCORE,
     OpeningDriveLedger,
     PaperLedger,
     ThemeMapLedger,
@@ -31,6 +32,8 @@ from core.strategy_books import BreakoutBook
 from core.theme_map import ThemeMapRegistry, ThemeMapStrategy
 from core.trading_day import load_manual_holiday_set, prev_trading_day_ymd, should_run_bot_today_kst
 from core.universe_cache import CachedSymbol, UniverseCache, cache_path, load_cache, save_cache, today_kst_yyyymmdd
+from core.vdu_score import score_bars, select_candidates
+from core.vdu_score_logger import write_vdu_score_csv
 
 
 _REPO_ROOT = Path(__file__).resolve().parent
@@ -80,6 +83,21 @@ class MaxVRunner:
                     max_positions=settings.max_positions,
                 )
             )
+        if settings.enable_vdu_score:
+            self.breakout_books.append(
+                BreakoutBook(
+                    name="vdu_score",
+                    strategy=VolatilityBreakoutStrategy(breakout_mode=BREAKOUT_MODE_K_RANGE),
+                    ledger=PaperLedger(
+                        path=settings.pace_log_dir / settings.paper_ledger_vdu_name,
+                        settings=settings,
+                        desc_row=dict(LEDGER_DESC_VDU_SCORE),
+                    ),
+                    max_positions=settings.vdu_max_positions,
+                )
+            )
+        self.vdu_pool: set[str] = set()
+        self.vdu_scores_ymd: str = ""
 
         self.od_strategy = OpeningDriveStrategy(
             gap_min=settings.od_gap_min,
@@ -399,6 +417,7 @@ class MaxVRunner:
         self.buy_orders_today = 0
         self._reset_heartbeat_counters()
         self._prepare_theme_map()
+        self._prepare_vdu_score()
 
         # Strategy prep: prefer cached/naver features, avoid KIS daily calls when available.
         # (pace-gate redesign: the strategy is price-only; volume screening is
@@ -528,6 +547,66 @@ class MaxVRunner:
             f"eligible_themes={n_elig} watch={len(self.theme_watch_symbols)} "
             f"path={path.name}"
         )
+
+    def _prepare_vdu_score(self) -> None:
+        """Overnight condensation scores → candidate pool for vdu_score arm."""
+        self.vdu_pool = set()
+        if not settings.enable_vdu_score:
+            return
+        ymd = today_kst_yyyymmdd(self._now_kst_local())
+        symbols = list(self.today_universe)
+        if not symbols:
+            self.logger.info("vdu_score: empty universe, pool=0")
+            return
+
+        from core.naver_universe import bars_newest_to_ascending, fetch_daily_ohlcv
+
+        scored = {}
+        fail = 0
+        for i, symbol in enumerate(symbols):
+            try:
+                raw = fetch_daily_ohlcv(
+                    symbol,
+                    pages=4,
+                    delay_sec=settings.naver_http_delay_sec,
+                )
+                # Drop today's incomplete bar if present (same calendar day).
+                today_dot = (
+                    f"{ymd[0:4]}.{ymd[4:6]}.{ymd[6:8]}"
+                )
+                if raw and raw[0].get("date") == today_dot:
+                    raw = raw[1:]
+                asc = bars_newest_to_ascending(raw)
+                scored[symbol] = score_bars(asc)
+            except Exception as exc:  # noqa: BLE001
+                fail += 1
+                self.logger.error(f"vdu_score bar fetch failed {symbol}: {exc}")
+            if (i + 1) % 20 == 0:
+                self.logger.info(f"vdu_score scoring progress {i + 1}/{len(symbols)}")
+
+        pool = select_candidates(
+            scored,
+            score_min=settings.vdu_score_min,
+            max_candidates=settings.vdu_max_candidates,
+            symbol_order=symbols,
+        )
+        self.vdu_pool = set(pool)
+        self.vdu_scores_ymd = ymd
+        path = write_vdu_score_csv(
+            log_dir=settings.pace_log_dir,
+            ymd=ymd,
+            scored=scored,
+            pool=pool,
+            symbol_order=symbols,
+        )
+        self.logger.info(
+            f"vdu_score ready: scored={len(scored)} pool={len(pool)} "
+            f"fail={fail} min={settings.vdu_score_min} csv={path.name}"
+        )
+        if pool:
+            preview = ",".join(pool[:10])
+            self.logger.info(f"vdu_score pool preview: {preview}")
+
     def liquidate_all_holdings_at_open(self) -> None:
         """
         Pre-open liquidation at 08:50 (KST): sell all current holdings.
@@ -725,14 +804,21 @@ class MaxVRunner:
                         cycle_signals += 1
                         cycle_buys += 1
 
-            # --- Breakout arms (K + prev_high) ---
+            # --- Breakout arms (K + prev_high + vdu_score) ---
             for book in self.breakout_books:
+                if book.name == "vdu_score" and symbol not in self.vdu_pool:
+                    continue
                 signal = book.strategy.on_quote(quote)
                 state = book.strategy.symbol_state.get(symbol)
                 breakout_price = int(state.breakout_price or 0) if state else 0
                 if breakout_price <= 0 or quote.current_price < breakout_price:
                     continue
 
+                pace_thr = (
+                    settings.vdu_pace_threshold
+                    if book.name == "vdu_score"
+                    else settings.pace_threshold
+                )
                 gate = evaluate_pace_gate(
                     cum_value=quote.cum_value,
                     value_ma5=feat.value_ma5,
@@ -740,7 +826,7 @@ class MaxVRunner:
                     current_price=quote.current_price,
                     breakout_price=breakout_price,
                     prev_close=feat.prev_close,
-                    pace_threshold=settings.pace_threshold,
+                    pace_threshold=pace_thr,
                     entry_start_hhmm=settings.pace_entry_start_hhmm,
                     entry_end_hhmm=settings.pace_entry_end_hhmm,
                     chase_limit_mult=settings.pace_chase_limit_mult,
@@ -849,6 +935,7 @@ class MaxVRunner:
             "감시중... "
             f"now={now_kst} KST watchlist={len(self.today_universe)} "
             f"theme_watch={len(self.theme_watch_symbols)} "
+            f"vdu_pool={len(self.vdu_pool)} "
             f"arms=[{book_status}] "
             f"paper={'Y' if settings.paper_mode else 'N'} "
             f"(cycles={self._hb_cycles}, quote_err={self._hb_quote_err}, "

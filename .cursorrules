@@ -75,6 +75,12 @@
 - 매주 금 장후 `python -m scripts.update_theme_map` → `config/theme_map.csv` (네이버 테마, 12종 초과 eligible=0).
 - 장중: 핫테마(+2% 비중≥50%) → 후발(중앙값 미만) 당일고점 돌파 + pace≥1.5 → 손절/트레일 -2% / 14:50 청산.
 
+최근 작업(2026-07-12) — 응축 스코어(VDU) 병행 전략:
+- `ENABLE_VDU_SCORE` → `logs/paper_ledger_vdu_score.csv` (K와 동일 익일 시가 청산 스키마, 독립 뱅크롤).
+- 장전: VDU/ATR수축/이평수렴/PP/OBV/MFI 점수 ≥70 후보(최대 30) → `logs/vdu_score_YYYYMMDD.csv`.
+- 장중: K=0.7 돌파 + pace≥2.0 (기존 K 페이스는 3.0 유지). 명세: `c:\cursor\04_fable5\WORK_ORDER_vdu_score.md`.
+- 모듈: `core/vdu_score.py`, `core/vdu_score_logger.py`. 테스트 `tests/test_vdu_score.py`.
+
 최근 작업(2026-07-11) — 3전략 병행 페이퍼:
 - `paper_ledger.csv`(K=0.7) + `paper_ledger_prev_high.csv`(전일고가) + `paper_ledger_opening_drive.csv` 각각 독립 뱅크롤/원장.
 - `main.py` 1회 실행으로 K·전일고가·Opening Drive 동시 감시(페이퍼). ENABLE_* 플래그로 on/off.
